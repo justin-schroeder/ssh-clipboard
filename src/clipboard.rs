@@ -1,0 +1,401 @@
+use std::sync::Mutex;
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
+use sha2::{Digest, Sha256};
+
+use crate::model::Representation;
+use crate::{filebundle, filebundle::BUNDLE_FORMAT};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    pub representations: Vec<Representation>,
+    pub fingerprint: [u8; 32],
+}
+
+impl Snapshot {
+    #[must_use]
+    pub fn new(mut representations: Vec<Representation>) -> Self {
+        representations.sort_by(|left, right| {
+            left.item
+                .cmp(&right.item)
+                .then_with(|| left.format.cmp(&right.format))
+        });
+        let fingerprint = fingerprint(&representations);
+        Self {
+            representations,
+            fingerprint,
+        }
+    }
+}
+
+#[async_trait]
+pub trait ClipboardBackend: Send + Sync {
+    async fn capture(&self) -> Result<Option<Snapshot>>;
+    async fn apply(&self, representations: &[Representation]) -> Result<Snapshot>;
+    fn name(&self) -> &'static str;
+
+    fn change_receiver(&self, _interval: Duration) -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
+        None
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub struct NativeClipboard {
+    context: Mutex<clipboard_rs::ClipboardContext>,
+    max_bytes: u64,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl NativeClipboard {
+    pub fn new(max_bytes: u64) -> Result<Self> {
+        use clipboard_rs::ClipboardContext;
+        let context = ClipboardContext::new()
+            .map_err(|error| anyhow::anyhow!("initialize native clipboard: {error}"))?;
+        Ok(Self {
+            context: Mutex::new(context),
+            max_bytes,
+        })
+    }
+
+    fn capture_sync(&self) -> Result<Option<Snapshot>> {
+        use clipboard_rs::Clipboard;
+        let context = self
+            .context
+            .lock()
+            .map_err(|_| anyhow::anyhow!("clipboard lock poisoned"))?;
+        let mut formats = context
+            .available_formats()
+            .map_err(|error| anyhow::anyhow!("enumerate clipboard formats: {error}"))?;
+        formats.sort();
+        formats.dedup();
+        if formats.iter().any(|format| is_sensitive_marker(format)) {
+            return Ok(None);
+        }
+        let mut total = 0_u64;
+        let mut representations = Vec::with_capacity(formats.len());
+        for format in formats {
+            if format.trim().is_empty() || is_internal_marker(&format) {
+                continue;
+            }
+            let Ok(data) = context.get_buffer(&format) else {
+                continue;
+            };
+            total = total
+                .checked_add(u64::try_from(data.len()).unwrap_or(u64::MAX))
+                .context("clipboard size overflow")?;
+            if total > self.max_bytes {
+                bail!(
+                    "clipboard is {total} bytes; configured limit is {}",
+                    self.max_bytes
+                );
+            }
+            representations.push(Representation {
+                item: 0,
+                format,
+                data,
+            });
+        }
+        if let Ok(files) = context.get_files()
+            && !files.is_empty()
+        {
+            let data = files
+                .iter()
+                .map(|file| {
+                    if file.starts_with("file://") {
+                        file.clone()
+                    } else {
+                        filebundle::path_to_uri(std::path::Path::new(file))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\r\n")
+                .into_bytes();
+            let size = u64::try_from(data.len()).unwrap_or(u64::MAX);
+            if !representations
+                .iter()
+                .any(|representation| representation.format == "text/uri-list")
+                && total.saturating_add(size) <= self.max_bytes
+            {
+                total += size;
+                representations.push(Representation {
+                    item: 0,
+                    format: "text/uri-list".into(),
+                    data,
+                });
+            }
+        }
+        add_portable_aliases(&mut representations, self.max_bytes.saturating_sub(total));
+        total = representations
+            .iter()
+            .map(|representation| u64::try_from(representation.data.len()).unwrap_or(u64::MAX))
+            .sum();
+        filebundle::attach_bundle(&mut representations, self.max_bytes.saturating_sub(total))?;
+        if representations.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(Snapshot::new(representations)))
+        }
+    }
+
+    fn apply_sync(&self, representations: &[Representation]) -> Result<Snapshot> {
+        use clipboard_rs::{Clipboard, ClipboardContent};
+        if representations.is_empty() {
+            bail!("clipboard payload is empty");
+        }
+        let total = representations.iter().try_fold(0_u64, |total, representation| {
+            total.checked_add(u64::try_from(representation.data.len()).unwrap_or(u64::MAX))
+        });
+        let total = total.context("clipboard size overflow")?;
+        if total > self.max_bytes {
+            bail!(
+                "clipboard is {total} bytes; configured limit is {}",
+                self.max_bytes
+            );
+        }
+        let mut contents = Vec::with_capacity(representations.len());
+        let mut added_files = false;
+        for representation in representations {
+            if representation.format.trim().is_empty()
+                || is_internal_marker(&representation.format)
+                || is_sensitive_marker(&representation.format)
+            {
+                continue;
+            }
+            if matches!(
+                representation.format.as_str(),
+                "text/uri-list" | "public.file-url" | "NSFilenamesPboardType"
+            ) && !added_files
+            {
+                let files = filebundle::parse_uri_list(&representation.data)
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                if !files.is_empty() {
+                    contents.push(ClipboardContent::Files(files));
+                    added_files = true;
+                    continue;
+                }
+            }
+            contents.push(ClipboardContent::Other(
+                representation.format.clone(),
+                representation.data.clone(),
+            ));
+        }
+        if contents.is_empty() {
+            bail!("clipboard payload has no safe representations");
+        }
+        let context = self
+            .context
+            .lock()
+            .map_err(|_| anyhow::anyhow!("clipboard lock poisoned"))?;
+        context
+            .set(contents)
+            .map_err(|error| anyhow::anyhow!("publish native clipboard formats: {error}"))?;
+        drop(context);
+        self.capture_sync()?
+            .context("native clipboard was empty immediately after publishing")
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[async_trait]
+impl ClipboardBackend for NativeClipboard {
+    async fn capture(&self) -> Result<Option<Snapshot>> {
+        self.capture_sync()
+    }
+
+    async fn apply(&self, representations: &[Representation]) -> Result<Snapshot> {
+        self.apply_sync(representations)
+    }
+
+    fn name(&self) -> &'static str {
+        #[cfg(target_os = "macos")]
+        return "NSPasteboard";
+        #[cfg(target_os = "linux")]
+        return if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            "Wayland"
+        } else {
+            "X11"
+        };
+    }
+
+    fn change_receiver(&self, interval: Duration) -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            // clipboard-rs' current Wayland watcher compares text and MIME names,
+            // so it cannot notice two different images with the same MIME. Full
+            // snapshot polling below is required for correctness on Wayland.
+            return None;
+        }
+        use clipboard_rs::{ClipboardHandler, ClipboardWatcher, ClipboardWatcherContext};
+        struct ChangeHandler(tokio::sync::mpsc::UnboundedSender<()>);
+        impl ClipboardHandler for ChangeHandler {
+            fn on_clipboard_change(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut watcher = ClipboardWatcherContext::new_with_interval(interval).ok()?;
+        watcher.add_handler(ChangeHandler(sender));
+        std::thread::Builder::new()
+            .name("ssh-clipboard-watcher".into())
+            .spawn(move || watcher.start_watch())
+            .ok()?;
+        Some(receiver)
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub struct NativeClipboard;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+impl NativeClipboard {
+    pub fn new(_max_bytes: u64) -> Result<Self> {
+        bail!("ssh-clipboard supports native clipboards on macOS and Linux")
+    }
+}
+
+fn fingerprint(representations: &[Representation]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for representation in representations {
+        digest.update(representation.item.to_be_bytes());
+        digest.update(
+            u64::try_from(representation.format.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        digest.update(representation.format.as_bytes());
+        digest.update(
+            u64::try_from(representation.data.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        digest.update(&representation.data);
+    }
+    digest.finalize().into()
+}
+
+fn is_sensitive_marker(format: &str) -> bool {
+    let lower = format.to_ascii_lowercase();
+    lower.contains("concealedtype")
+        || lower.contains("passwordmanagerhint")
+        || lower.contains("keepass")
+        || lower == "application/x-nspasteboard-concealed-type"
+}
+
+fn is_internal_marker(format: &str) -> bool {
+    let lower = format.to_ascii_lowercase();
+    lower.contains("transienttype") || lower.contains("autogeneratedtype") || format == BUNDLE_FORMAT
+}
+
+fn add_portable_aliases(representations: &mut Vec<Representation>, mut remaining: u64) {
+    let originals = representations.clone();
+    for representation in originals {
+        let alias = match representation.format.as_str() {
+            "public.utf8-plain-text" | "public.plain-text" | "NSStringPboardType" | "UTF8_STRING" => {
+                "text/plain;charset=utf-8"
+            }
+            "public.html" => "text/html",
+            "public.rtf" => "text/rtf",
+            "public.png" => "image/png",
+            "public.tiff" => "image/tiff",
+            "public.heic" => "image/heic",
+            "com.adobe.pdf" => "application/pdf",
+            "public.file-url" => "text/uri-list",
+            _ => continue,
+        };
+        if representations
+            .iter()
+            .any(|existing| existing.item == representation.item && existing.format == alias)
+        {
+            continue;
+        }
+        let size = u64::try_from(representation.data.len()).unwrap_or(u64::MAX);
+        if size > remaining {
+            continue;
+        }
+        remaining -= size;
+        representations.push(Representation {
+            item: representation.item,
+            format: alias.to_owned(),
+            data: representation.data,
+        });
+    }
+}
+
+#[cfg(test)]
+pub mod test_support {
+    use tokio::sync::Mutex as AsyncMutex;
+
+    use super::*;
+
+    #[derive(Default)]
+    pub struct MockClipboard {
+        snapshot: AsyncMutex<Option<Snapshot>>,
+    }
+
+    impl MockClipboard {
+        pub async fn replace(&self, representations: Vec<Representation>) {
+            *self.snapshot.lock().await = Some(Snapshot::new(representations));
+        }
+    }
+
+    #[async_trait]
+    impl ClipboardBackend for MockClipboard {
+        async fn capture(&self) -> Result<Option<Snapshot>> {
+            Ok(self.snapshot.lock().await.clone())
+        }
+
+        async fn apply(&self, representations: &[Representation]) -> Result<Snapshot> {
+            let snapshot = Snapshot::new(representations.to_vec());
+            *self.snapshot.lock().await = Some(snapshot.clone());
+            Ok(snapshot)
+        }
+
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aliases_are_additive_and_preserve_original_bytes() {
+        let mut representations = vec![Representation {
+            item: 0,
+            format: "public.tiff".into(),
+            data: vec![1, 2, 3],
+        }];
+        add_portable_aliases(&mut representations, 3);
+        assert_eq!(representations.len(), 2);
+        assert_eq!(representations[0].format, "public.tiff");
+        assert_eq!(representations[1].format, "image/tiff");
+        assert_eq!(representations[0].data, representations[1].data);
+    }
+
+    #[test]
+    fn password_manager_markers_block_the_entire_clipboard() {
+        assert!(is_sensitive_marker("org.nspasteboard.ConcealedType"));
+        assert!(is_sensitive_marker("x-kde-passwordManagerHint"));
+    }
+
+    #[test]
+    fn fingerprint_includes_format_and_item() {
+        let first = Snapshot::new(vec![Representation {
+            item: 0,
+            format: "text/plain".into(),
+            data: b"same".to_vec(),
+        }]);
+        let second = Snapshot::new(vec![Representation {
+            item: 0,
+            format: "text/html".into(),
+            data: b"same".to_vec(),
+        }]);
+        assert_ne!(first.fingerprint, second.fingerprint);
+    }
+}

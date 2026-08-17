@@ -1,0 +1,51 @@
+{
+  "name": "ssh-clipboard",
+  "version": "0.1.0",
+  "description": "Native, encrypted clipboard sync over SSH for macOS and Linux",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/justin-schroeder/ssh-clipboard.git"
+  },
+  "homepage": "https://github.com/justin-schroeder/ssh-clipboard#readme",
+  "bugs": "https://github.com/justin-schroeder/ssh-clipboard/issues",
+  "type": "module",
+  "bin": {
+    "ssh-clipboard": "bin/ssh-clipboard.js"
+  },
+  "files": [
+    "bin",
+    "vendor",
+    "README.md",
+    "LICENSE"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test npm-tests/*.test.mjs",
+    "stage:binaries": "node scripts/stage-npm-binaries.mjs",
+    "verify:binaries": "node scripts/verify-npm-binaries.mjs",
+    "prepack": "npm run verify:binaries"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "keywords": [
+    "clipboard",
+    "ssh",
+    "mosh",
+    "tmux",
+    "macos",
+    "linux"
+  ]
+}

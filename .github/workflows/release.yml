@@ -1,0 +1,91 @@
+name: Release bundle
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  binary:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            name: ssh-clipboard-darwin-arm64
+          - runner: macos-15-intel
+            name: ssh-clipboard-darwin-amd64
+          - runner: ubuntu-24.04
+            name: ssh-clipboard-linux-amd64
+          - runner: ubuntu-24.04-arm
+            name: ssh-clipboard-linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - run: cp target/release/ssh-clipboard ${{ matrix.name }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+
+  bundle:
+    needs: binary
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: chmod +x dist/* && tar -C dist -czf ssh-clipboard-bundle.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ssh-clipboard-bundle
+          path: ssh-clipboard-bundle.tar.gz
+
+  npm-package:
+    needs: binary
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: npm run stage:binaries -- dist
+      - run: npm pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ssh-clipboard-npm
+          path: ssh-clipboard-*.tgz
+
+  publish-npm:
+    if: vars.NPM_PUBLISH == 'true'
+    needs: npm-package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ssh-clipboard-npm
+          path: package
+      - run: npm publish package/ssh-clipboard-*.tgz --access public --provenance

@@ -1,0 +1,6 @@
+/target
+/dist
+/vendor/*/
+/vendor/manifest.json
+*.log
+.DS_Store
