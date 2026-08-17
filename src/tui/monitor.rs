@@ -407,7 +407,10 @@ mod tests {
     #[test]
     fn monitor_renders_peer_health_and_native_activity() {
         let (sender, receiver) = mpsc::channel();
-        let mut config = Config::default();
+        let mut config = Config {
+            node_name: "local".into(),
+            ..Config::default()
+        };
         config.peers.push(crate::config::PeerConfig {
             name: "server".into(),
             ssh_command: "ssh server".into(),

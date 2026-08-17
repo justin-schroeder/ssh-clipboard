@@ -5,6 +5,9 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use clipboard_rs::{ClipboardHandler, ClipboardWatcher, ClipboardWatcherContext};
+
 use crate::model::Representation;
 use crate::{filebundle, filebundle::BUNDLE_FORMAT};
 
@@ -45,6 +48,16 @@ pub trait ClipboardBackend: Send + Sync {
 pub struct NativeClipboard {
     context: Mutex<clipboard_rs::ClipboardContext>,
     max_bytes: u64,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct ChangeHandler(tokio::sync::mpsc::UnboundedSender<()>);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl ClipboardHandler for ChangeHandler {
+    fn on_clipboard_change(&mut self) {
+        let _ = self.0.send(());
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -228,13 +241,6 @@ impl ClipboardBackend for NativeClipboard {
             // so it cannot notice two different images with the same MIME. Full
             // snapshot polling below is required for correctness on Wayland.
             return None;
-        }
-        use clipboard_rs::{ClipboardHandler, ClipboardWatcher, ClipboardWatcherContext};
-        struct ChangeHandler(tokio::sync::mpsc::UnboundedSender<()>);
-        impl ClipboardHandler for ChangeHandler {
-            fn on_clipboard_change(&mut self) {
-                let _ = self.0.send(());
-            }
         }
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut watcher = ClipboardWatcherContext::new_with_interval(interval).ok()?;
