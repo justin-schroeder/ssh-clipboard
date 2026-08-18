@@ -34,6 +34,7 @@ enum Stage {
 struct VerifiedPeer {
     command: String,
     probe: ProbeResult,
+    installation: deploy::Installation,
 }
 
 #[derive(Clone, Debug)]
@@ -45,7 +46,7 @@ struct TailscaleChoice {
 enum UiMessage {
     Verified {
         command: String,
-        result: Result<ProbeResult, String>,
+        result: Result<(ProbeResult, deploy::Installation), String>,
     },
     TailscaleDiscovered(Vec<tailscale::Peer>),
     TailscaleVerified(Result<Vec<VerifiedPeer>, String>),
@@ -53,6 +54,7 @@ enum UiMessage {
     Progress {
         peer: String,
         detail: String,
+        complete: bool,
     },
     Installed(Result<(), String>),
 }
@@ -70,7 +72,7 @@ struct SetupApp {
     last_verified: usize,
     active_peer: String,
     detail: String,
-    completed: Vec<String>,
+    completed: Vec<(String, String)>,
     error: Option<String>,
     receiver: Receiver<UiMessage>,
     sender: Sender<UiMessage>,
@@ -178,10 +180,11 @@ impl SetupApp {
                         let result = async {
                             let probe = ssh::probe(&command).await?;
                             deploy::binary_for(&probe.os, &probe.arch)?;
-                            Ok(probe)
+                            let installation = deploy::inspect_remote(&command, &probe).await?;
+                            Ok((probe, installation))
                         }
                         .await
-                        .map_err(|error: anyhow::Error| error.to_string());
+                        .map_err(|error: anyhow::Error| format!("{error:#}"));
                         let _ = sender.send(UiMessage::Verified { command, result });
                     });
                 } else if self.tailscale_choices.iter().any(|choice| choice.selected) {
@@ -239,12 +242,19 @@ impl SetupApp {
                         .with_context(|| format!("verify {}", peer.hostname))?;
                     deploy::binary_for(&probe.os, &probe.arch)
                         .with_context(|| format!("check compatibility for {}", peer.hostname))?;
-                    verified.push(VerifiedPeer { command, probe });
+                    let installation = deploy::inspect_remote(&command, &probe)
+                        .await
+                        .with_context(|| format!("inspect {}", peer.hostname))?;
+                    verified.push(VerifiedPeer {
+                        command,
+                        probe,
+                        installation,
+                    });
                 }
                 Ok(verified)
             }
             .await
-            .map_err(|error: anyhow::Error| error.to_string());
+            .map_err(|error: anyhow::Error| format!("{error:#}"));
             let _ = sender.send(UiMessage::TailscaleVerified(result));
         });
     }
@@ -264,7 +274,7 @@ impl SetupApp {
         self.handle.spawn(async move {
             let result = install_all(config, peers, sender.clone())
                 .await
-                .map_err(|error| error.to_string());
+                .map_err(|error| format!("{error:#}"));
             let _ = sender.send(UiMessage::Installed(result));
         });
     }
@@ -272,9 +282,13 @@ impl SetupApp {
     fn on_message(&mut self, message: UiMessage) {
         match message {
             UiMessage::Verified { command, result } => match result {
-                Ok(probe) => {
+                Ok((probe, installation)) => {
                     if !self.peers.iter().any(|peer| peer.command == command) {
-                        self.peers.push(VerifiedPeer { command, probe });
+                        self.peers.push(VerifiedPeer {
+                            command,
+                            probe,
+                            installation,
+                        });
                     }
                     self.last_verified = 1;
                     self.stage = Stage::Confirmed;
@@ -318,9 +332,13 @@ impl SetupApp {
             UiMessage::VerificationProgress(peer) => {
                 self.verifying = format!("{peer} via Tailscale");
             }
-            UiMessage::Progress { peer, detail } => {
-                if detail == "Installed and running" && !self.completed.contains(&peer) {
-                    self.completed.push(peer.clone());
+            UiMessage::Progress {
+                peer,
+                detail,
+                complete,
+            } => {
+                if complete && !self.completed.iter().any(|(name, _)| name == &peer) {
+                    self.completed.push((peer.clone(), detail.clone()));
                 }
                 self.active_peer = peer;
                 self.detail = detail;
@@ -519,16 +537,17 @@ impl SetupApp {
                             ),
                         ]),
                         Line::styled(peer.command.clone(), Style::new().fg(MUTED)),
+                        Line::styled(peer.installation.summary(), Style::new().fg(CYAN)),
                         Line::raw(""),
                         Line::styled(
-                            "The host is reachable without a password and ready for installation.",
+                            "The host is reachable without a password and ready.",
                             Style::new().fg(SOFT),
                         ),
                     ])
                 } else {
                     let names = self.peers[self.peers.len() - verified_count..]
                         .iter()
-                        .map(|peer| peer.probe.hostname.as_str())
+                        .map(|peer| format!("{} ({})", peer.probe.hostname, peer.installation.summary()))
                         .collect::<Vec<_>>()
                         .join(", ");
                     Text::from(vec![
@@ -546,23 +565,37 @@ impl SetupApp {
                     ])
                 }
             }
-            Stage::Ready => Text::from(vec![
-                Line::styled("✓  Your clipboards are connected", Style::new().fg(GREEN).bold()),
-                Line::raw(""),
-                Line::styled(
-                    format!("{} peer(s) configured", self.peers.len()),
-                    Style::new().fg(SOFT).bold(),
-                ),
-                Line::styled(
-                    "Copy normally on either machine. The destination’s native clipboard changes, so Raycast and other clipboard managers see it naturally.",
-                    Style::new().fg(SOFT),
-                ),
-                Line::raw(""),
-                Line::styled(
-                    "Run ssh-clipboard monitor any time to watch activity and connection health.",
-                    Style::new().fg(MUTED),
-                ),
-            ]),
+            Stage::Ready => {
+                let pending = self
+                    .completed
+                    .iter()
+                    .filter(|(_, detail)| detail.contains("next login"))
+                    .count();
+                Text::from(vec![
+                    Line::styled(
+                        if pending == 0 {
+                            "✓  Your clipboards are connected".to_owned()
+                        } else {
+                            format!("✓  Setup complete · {pending} machine(s) start at next login")
+                        },
+                        Style::new().fg(GREEN).bold(),
+                    ),
+                    Line::raw(""),
+                    Line::styled(
+                        format!("{} peer(s) configured", self.peers.len()),
+                        Style::new().fg(SOFT).bold(),
+                    ),
+                    Line::styled(
+                        "Copy normally on either machine. The destination’s native clipboard changes, so Raycast and other clipboard managers see it naturally.",
+                        Style::new().fg(SOFT),
+                    ),
+                    Line::raw(""),
+                    Line::styled(
+                        "Run ssh-clipboard monitor any time to watch activity and connection health.",
+                        Style::new().fg(MUTED),
+                    ),
+                ])
+            }
             Stage::Failed => Text::from(vec![
                 Line::styled("Installation paused", Style::new().fg(RED).bold()),
                 Line::raw(""),
@@ -668,7 +701,7 @@ impl SetupApp {
         let mut lines = self
             .completed
             .iter()
-            .map(|peer| Line::styled(format!("✓  {peer}"), Style::new().fg(GREEN)))
+            .map(|(peer, detail)| Line::styled(format!("✓  {peer}   {detail}"), Style::new().fg(GREEN)))
             .collect::<Vec<_>>();
         if !self.active_peer.is_empty() {
             lines.push(Line::from(vec![
@@ -729,40 +762,57 @@ impl SetupApp {
 
 async fn install_all(config: Config, peers: Vec<VerifiedPeer>, sender: Sender<UiMessage>) -> Result<()> {
     let mut local = config;
-    local.peers = peers
-        .iter()
-        .map(|peer| PeerConfig {
-            name: peer.probe.hostname.clone(),
-            ssh_command: peer.command.clone(),
-        })
-        .collect();
+    for peer in &peers {
+        merge_peer(
+            &mut local.peers,
+            PeerConfig {
+                name: peer.probe.hostname.clone(),
+                ssh_command: peer.command.clone(),
+            },
+        );
+    }
     local.save()?;
     for peer in &peers {
         let name = peer.probe.hostname.clone();
         let progress_sender = sender.clone();
-        deploy::install_remote(&peer.command, &peer.probe, |_, detail| {
+        let outcome = deploy::install_remote(&peer.command, &peer.probe, |_, detail| {
             let _ = progress_sender.send(UiMessage::Progress {
                 peer: name.clone(),
                 detail: detail.to_owned(),
+                complete: false,
             });
         })
         .await
         .with_context(|| format!("install {name}"))?;
         let _ = sender.send(UiMessage::Progress {
             peer: name,
-            detail: "Installed and running".into(),
+            detail: outcome.detail().into(),
+            complete: true,
         });
     }
     let _ = sender.send(UiMessage::Progress {
         peer: local.node_name.clone(),
         detail: "Installing this machine’s service".into(),
+        complete: false,
     });
-    deploy::install_local_service().await?;
+    let outcome = deploy::install_local_service().await?;
     let _ = sender.send(UiMessage::Progress {
         peer: local.node_name,
-        detail: "Installed and running".into(),
+        detail: outcome.detail().into(),
+        complete: true,
     });
     Ok(())
+}
+
+fn merge_peer(peers: &mut Vec<PeerConfig>, configured: PeerConfig) {
+    if let Some(existing) = peers
+        .iter_mut()
+        .find(|existing| existing.ssh_command == configured.ssh_command || existing.name == configured.name)
+    {
+        *existing = configured;
+    } else {
+        peers.push(configured);
+    }
 }
 
 pub async fn run_setup(config: Config) -> Result<()> {
@@ -892,6 +942,12 @@ mod tests {
                 home: "/Users/me".into(),
                 hostname: "MacBookPro.home.local".into(),
             },
+            installation: deploy::Installation {
+                version: None,
+                config_exists: false,
+                service_exists: false,
+                running: false,
+            },
         });
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -908,13 +964,10 @@ mod tests {
                     .collect::<String>()
             })
             .collect::<Vec<_>>();
-        let verified_row = rows
-            .iter()
-            .position(|row| row.contains("ready for installation"))
-            .unwrap();
+        let verified_row = rows.iter().position(|row| row.contains("Not installed")).unwrap();
         let actions_row = rows.iter().position(|row| row.contains("enter install")).unwrap();
         assert!(actions_row > verified_row);
-        assert!(actions_row - verified_row <= 5);
+        assert!(actions_row - verified_row <= 6);
         assert!(actions_row < rows.len() / 2);
     }
 
@@ -933,6 +986,12 @@ mod tests {
                 home: "/Users/me".into(),
                 hostname: "MacBookPro.home.local".into(),
             },
+            installation: deploy::Installation {
+                version: Some(crate::update::CURRENT_VERSION.into()),
+                config_exists: true,
+                service_exists: true,
+                running: true,
+            },
         });
 
         app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
@@ -943,5 +1002,41 @@ mod tests {
         assert_eq!(app.peers.len(), 1);
         assert_eq!(app.peers[0].command, "ssh macbookserver");
         assert!(app.help().to_string().contains("enter verify / install"));
+    }
+
+    #[test]
+    fn setup_merges_peers_without_erasing_existing_connections() {
+        let mut peers = vec![PeerConfig {
+            name: "existing".into(),
+            ssh_command: "ssh existing".into(),
+        }];
+        merge_peer(
+            &mut peers,
+            PeerConfig {
+                name: "new".into(),
+                ssh_command: "ssh new".into(),
+            },
+        );
+        merge_peer(
+            &mut peers,
+            PeerConfig {
+                name: "existing-renamed".into(),
+                ssh_command: "ssh existing".into(),
+            },
+        );
+
+        assert_eq!(
+            peers,
+            vec![
+                PeerConfig {
+                    name: "existing-renamed".into(),
+                    ssh_command: "ssh existing".into(),
+                },
+                PeerConfig {
+                    name: "new".into(),
+                    ssh_command: "ssh new".into(),
+                },
+            ]
+        );
     }
 }

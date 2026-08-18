@@ -153,7 +153,9 @@ async fn run() -> Result<()> {
                     None => std::env::current_exe()?,
                 };
                 let binary = binary.canonicalize().context("resolve service binary")?;
-                service::install(&binary).await
+                let outcome = service::install(&binary).await?;
+                println!("{}", outcome.detail());
+                Ok(())
             }
             ServiceAction::Start => service::control(service::Action::Start).await,
             ServiceAction::Stop => service::control(service::Action::Stop).await,

@@ -16,12 +16,14 @@ use tokio::sync::watch;
 use crate::config::Config;
 use crate::daemon::{self, Status};
 use crate::model::{Direction, MonitorEvent, human_bytes};
+use crate::update;
 
 use super::{ACCENT, CYAN, GREEN, MUTED, PANEL, RED, SOFT, YELLOW, clean_truncate};
 
 enum UiMessage {
     Event(MonitorEvent),
     Status(Status),
+    Offline(String),
     Error(String),
 }
 
@@ -80,7 +82,6 @@ impl MonitorApp {
     fn on_message(&mut self, message: UiMessage) {
         match message {
             UiMessage::Event(event) => {
-                self.error = None;
                 if self.paused {
                     return;
                 }
@@ -94,7 +95,14 @@ impl MonitorApp {
                 self.events.push_front(event);
                 self.events.truncate(200);
             }
-            UiMessage::Status(status) => self.status = Some(status),
+            UiMessage::Status(status) => {
+                self.status = Some(status);
+                self.error = None;
+            }
+            UiMessage::Offline(error) => {
+                self.status = None;
+                self.error = Some(error);
+            }
             UiMessage::Error(error) => self.error = Some(error),
         }
     }
@@ -165,12 +173,16 @@ impl MonitorApp {
             .as_ref()
             .map(|status| status.connected_peers.iter().cloned().collect::<HashSet<_>>())
             .unwrap_or_default();
-        let mut peer_names = self
-            .config
-            .peers
-            .iter()
-            .map(|peer| peer.name.clone())
-            .collect::<Vec<_>>();
+        let mut peer_names = self.status.as_ref().map_or_else(
+            || {
+                self.config
+                    .peers
+                    .iter()
+                    .map(|peer| peer.name.clone())
+                    .collect::<Vec<_>>()
+            },
+            |status| status.configured_peers.clone(),
+        );
         for peer in &connected {
             if !peer_names.contains(peer) {
                 peer_names.push(peer.clone());
@@ -186,15 +198,15 @@ impl MonitorApp {
         for peer in peer_names {
             spans.push(Span::styled("     │     ", Style::new().fg(PANEL)));
             let is_connected = connected.contains(&peer);
-            let peer_version = self.status.as_ref().and_then(|status| {
-                status
-                    .peers
-                    .iter()
-                    .find(|status| status.name == peer)
-                    .and_then(|status| status.version.as_deref())
-            });
-            let is_current =
-                is_connected && peer_version.is_some_and(|version| Some(version) == desired_version);
+            let peer_status = self
+                .status
+                .as_ref()
+                .and_then(|status| status.peers.iter().find(|status| status.name == peer));
+            let peer_version = peer_status.and_then(|status| status.version.as_deref());
+            let peer_desired = peer_status.and_then(|status| status.desired_version.as_deref());
+            let is_current = is_connected
+                && peer_version.is_some_and(|version| Some(version) == desired_version)
+                && peer_desired.is_none_or(|version| Some(version) == desired_version);
             let color = if is_current {
                 GREEN
             } else if is_connected {
@@ -210,6 +222,16 @@ impl MonitorApp {
             spans.push(Span::styled(
                 if !is_connected {
                     "  reconnecting".to_owned()
+                } else if peer_version.is_none() {
+                    "  connected · legacy (upgrade required)".to_owned()
+                } else if peer_desired.is_some_and(|desired| {
+                    peer_version.is_some_and(|version| update::newer_version(version, desired))
+                }) {
+                    format!(
+                        "  updating · v{} → v{}",
+                        peer_version.unwrap_or("legacy"),
+                        peer_desired.unwrap_or("unknown")
+                    )
                 } else if is_current {
                     format!("  connected · v{}", peer_version.unwrap_or("legacy"))
                 } else {
@@ -222,13 +244,16 @@ impl MonitorApp {
             .status
             .as_ref()
             .map_or("detecting", |status| status.clipboard_backend.as_str());
-        let version = self.status.as_ref().map_or("detecting", |status| {
-            if status.version == status.desired_version {
-                status.version.as_str()
-            } else {
-                status.desired_version.as_str()
-            }
-        });
+        let version = self.status.as_ref().map_or_else(
+            || "detecting".to_owned(),
+            |status| {
+                if status.version == status.desired_version {
+                    format!("v{}", status.version)
+                } else {
+                    format!("v{} → v{}", status.version, status.desired_version)
+                }
+            },
+        );
         let block = panel("  Peers  ");
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -240,7 +265,7 @@ impl MonitorApp {
                     muted("backend "),
                     Span::styled(backend.to_owned(), Style::new().fg(SOFT)),
                     muted("     version "),
-                    Span::styled(version.to_owned(), Style::new().fg(SOFT)),
+                    Span::styled(version, Style::new().fg(SOFT)),
                     muted("     sent "),
                     Span::styled(human_bytes(self.sent), Style::new().fg(SOFT)),
                     muted("     received "),
@@ -408,8 +433,13 @@ async fn monitor_feed(sender: Sender<UiMessage>, mut shutdown: watch::Receiver<b
 
 async fn status_feed(sender: Sender<UiMessage>, mut shutdown: watch::Receiver<bool>) {
     loop {
-        if let Ok(status) = daemon::query_status().await {
-            let _ = sender.send(UiMessage::Status(status));
+        match daemon::query_status().await {
+            Ok(status) => {
+                let _ = sender.send(UiMessage::Status(status));
+            }
+            Err(error) => {
+                let _ = sender.send(UiMessage::Offline(error.to_string()));
+            }
         }
         tokio::select! {
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -463,6 +493,7 @@ mod tests {
             clipboard_backend: "NSPasteboard".into(),
             version: crate::update::CURRENT_VERSION.into(),
             desired_version: crate::update::CURRENT_VERSION.into(),
+            configured_peers: vec!["server".into()],
             connected_peers: vec!["server".into()],
             peers: vec![crate::daemon::PeerStatus {
                 node_id: Uuid::new_v4(),
@@ -499,5 +530,86 @@ mod tests {
         assert!(rendered.contains("server  connected"));
         assert!(rendered.contains("design.pdf"));
         assert!(rendered.contains("4.0 KiB"));
+    }
+
+    #[test]
+    fn monitor_drops_stale_status_when_the_daemon_disappears() {
+        let (_sender, receiver) = mpsc::channel();
+        let config = Config {
+            node_name: "local".into(),
+            ..Config::default()
+        };
+        let mut app = MonitorApp::new(config.clone(), receiver);
+        app.on_message(UiMessage::Status(Status {
+            running: true,
+            node_id: config.node_id,
+            node_name: config.node_name,
+            clipboard_backend: "NSPasteboard".into(),
+            version: crate::update::CURRENT_VERSION.into(),
+            desired_version: crate::update::CURRENT_VERSION.into(),
+            configured_peers: Vec::new(),
+            connected_peers: Vec::new(),
+            peers: Vec::new(),
+        }));
+        app.on_message(UiMessage::Offline("daemon socket unavailable".into()));
+
+        assert!(app.status.is_none());
+        assert_eq!(app.error.as_deref(), Some("daemon socket unavailable"));
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("● OFFLINE"));
+        assert!(rendered.contains("Connection unavailable"));
+    }
+
+    #[test]
+    fn monitor_shows_running_and_desired_versions_during_an_update() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut config = Config {
+            node_name: "local".into(),
+            ..Config::default()
+        };
+        config.peers.push(crate::config::PeerConfig {
+            name: "server".into(),
+            ssh_command: "ssh server".into(),
+        });
+        let mut app = MonitorApp::new(config.clone(), receiver);
+        app.on_message(UiMessage::Status(Status {
+            running: true,
+            node_id: config.node_id,
+            node_name: config.node_name,
+            clipboard_backend: "NSPasteboard".into(),
+            version: crate::update::CURRENT_VERSION.into(),
+            desired_version: "9.0.0".into(),
+            configured_peers: vec!["server".into()],
+            connected_peers: vec!["server".into()],
+            peers: vec![crate::daemon::PeerStatus {
+                node_id: Uuid::new_v4(),
+                name: "server".into(),
+                version: Some(crate::update::CURRENT_VERSION.into()),
+                desired_version: Some("9.0.0".into()),
+            }],
+        }));
+
+        let backend = TestBackend::new(160, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("updating"));
+        assert!(rendered.contains(&format!("v{} → v9.0.0", crate::update::CURRENT_VERSION)));
     }
 }

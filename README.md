@@ -23,7 +23,7 @@ npm i -g ssh-clipboard
 ssh-clipboard
 ```
 
-The first-run TUI offers compatible online machines from Tailscale when it is installed, or accepts any passwordless SSH connection. It verifies each connection, installs the right native Rust binary on every selected peer, and starts a per-user background service. After that, it just feels like one clipboard.
+The first-run TUI offers compatible online machines from Tailscale when it is installed, or accepts any passwordless SSH connection. It verifies each connection, inspects any existing installation, installs or upgrades only when needed, and starts a per-user background service without replacing that machine’s identity or peer configuration. After that, it just feels like one clipboard.
 
 - **Native:** macOS pasteboard plus Linux Wayland/X11—not terminal escape tricks.
 - **Private:** persistent peer-to-peer SSH; no relay, account, port, or new encryption key.
@@ -38,7 +38,7 @@ ssh-clipboard setup            # add or repair peers
 ssh-clipboard update --check   # compare this node with npm @latest
 ```
 
-Every installed daemon independently checks the stable npm release and gossips its verified desired version to connected peers. Any online machine can therefore trigger convergence; there is no permanent update coordinator. Packages are accepted only after npm SHA-512 integrity, the bundled SHA-256 manifest, executable target, and reported binary version all agree. Updates retain the previous executable, replace the live binary atomically, and let launchd/systemd restart the daemon.
+Every installed daemon independently checks the stable npm release and gossips its verified desired version to connected peers. Any online machine can therefore trigger convergence; there is no permanent update coordinator. Packages are accepted only after npm SHA-512 integrity, the bundled SHA-256 manifest, executable target, and reported binary version all agree. Updates retain the previous executable, replace the live binary atomically, and explicitly ask launchd/systemd to restart the daemon.
 
 macOS and Linux · arm64 and x64 · Rust + [Ratatui](https://ratatui.rs)
 

@@ -80,8 +80,8 @@ pub async fn upload_binary(raw: &str, binary: &Path) -> Result<()> {
     upload(raw, remote, &tokio::fs::read(binary).await?).await
 }
 
-pub async fn upload_config(raw: &str, bytes: &[u8]) -> Result<()> {
-    let remote = r#"set -eu; umask 077; mkdir -p "$HOME/.config/ssh-clipboard"; tmp="$HOME/.config/ssh-clipboard/.config.tmp.$$"; trap 'rm -f "$tmp"' EXIT; cat > "$tmp"; chmod 600 "$tmp"; mv "$tmp" "$HOME/.config/ssh-clipboard/config.json"; trap - EXIT"#;
+pub async fn upload_config_if_missing(raw: &str, bytes: &[u8]) -> Result<()> {
+    let remote = r#"set -eu; umask 077; mkdir -p "$HOME/.config/ssh-clipboard"; destination="$HOME/.config/ssh-clipboard/config.json"; if [ -e "$destination" ]; then cat >/dev/null; exit 0; fi; tmp="$HOME/.config/ssh-clipboard/.config.tmp.$$"; trap 'rm -f "$tmp"' EXIT; cat > "$tmp"; chmod 600 "$tmp"; mv "$tmp" "$destination"; trap - EXIT"#;
     upload(raw, remote, bytes).await
 }
 

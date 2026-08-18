@@ -1,10 +1,58 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use uuid::Uuid;
 
 use crate::config::{Config, paths};
 use crate::service;
 use crate::ssh::{self, ProbeResult};
+use crate::update::{self, CURRENT_VERSION};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Installation {
+    pub version: Option<String>,
+    pub config_exists: bool,
+    pub service_exists: bool,
+    pub running: bool,
+}
+
+impl Installation {
+    #[must_use]
+    pub fn needs_binary(&self) -> bool {
+        match self.version.as_deref() {
+            Some(version) if version == CURRENT_VERSION => false,
+            Some(version) if update::newer_version(CURRENT_VERSION, version) => false,
+            None | Some(_) => true,
+        }
+    }
+
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match (self.version.as_deref(), self.service_exists, self.running) {
+            (None, true, _) => format!("Incomplete installation · repair with v{CURRENT_VERSION}"),
+            (None, false, _) => format!("Not installed · ready for v{CURRENT_VERSION}"),
+            (Some(version), false, _) if version == CURRENT_VERSION => {
+                format!("v{version} installed · service setup needed")
+            }
+            (Some(version), true, true) if version == CURRENT_VERSION => {
+                format!("Already installed and running · v{version}")
+            }
+            (Some(version), true, false) if version == CURRENT_VERSION => {
+                format!("Already installed · v{version} · service restart needed")
+            }
+            (Some(version), false, _) if update::newer_version(CURRENT_VERSION, version) => {
+                format!("Newer v{version} installed · service setup needed")
+            }
+            (Some(version), true, true) if update::newer_version(CURRENT_VERSION, version) => {
+                format!("Newer version already installed · v{version}")
+            }
+            (Some(version), true, false) if update::newer_version(CURRENT_VERSION, version) => {
+                format!("Newer v{version} installed · service restart needed")
+            }
+            (Some(version), _, _) => format!("Upgrade ready · v{version} → v{CURRENT_VERSION}"),
+        }
+    }
+}
 
 pub fn binary_for(os: &str, arch: &str) -> Result<PathBuf> {
     if !matches!(os, "darwin" | "linux") || !matches!(arch, "arm64" | "amd64") {
@@ -41,29 +89,97 @@ fn binary_candidates(current: &Path, os: &str, arch: &str, bundle_root: Option<&
     candidates
 }
 
-pub async fn install_remote<F>(ssh_command: &str, probe: &ProbeResult, mut progress: F) -> Result<()>
+pub async fn install_remote<F>(
+    ssh_command: &str,
+    probe: &ProbeResult,
+    mut progress: F,
+) -> Result<service::InstallOutcome>
 where
     F: FnMut(&str, &str),
 {
-    progress("prepare", "Selecting the peer binary");
-    let binary = binary_for(&probe.os, &probe.arch)?;
-    progress("upload", "Streaming the binary over encrypted SSH");
-    ssh::upload_binary(ssh_command, &binary).await?;
-    let mut remote = Config::default();
-    if !probe.hostname.is_empty() {
-        remote.node_name.clone_from(&probe.hostname);
+    progress("inspect", "Inspecting the existing installation");
+    let installation = inspect_remote(ssh_command, probe).await?;
+    if installation.needs_binary() {
+        let binary = binary_for(&probe.os, &probe.arch)?;
+        let detail = installation.version.as_ref().map_or_else(
+            || format!("Installing v{CURRENT_VERSION}"),
+            |version| format!("Upgrading v{version} → v{CURRENT_VERSION}"),
+        );
+        progress("upload", &detail);
+        ssh::upload_binary(ssh_command, &binary).await?;
+    } else {
+        progress("binary", &installation.summary());
     }
-    let mut encoded = serde_json::to_vec_pretty(&remote)?;
-    encoded.push(b'\n');
-    progress("configure", "Writing private node configuration");
-    ssh::upload_config(ssh_command, &encoded).await?;
-    progress("service", "Installing the per-user background service");
-    ssh::run(
+
+    if installation.config_exists {
+        progress("configure", "Keeping existing identity and peer configuration");
+    } else {
+        let mut remote = Config::default();
+        if !probe.hostname.is_empty() {
+            remote.node_name.clone_from(&probe.hostname);
+        }
+        let mut encoded = serde_json::to_vec_pretty(&remote)?;
+        encoded.push(b'\n');
+        progress("configure", "Creating a private node configuration");
+        ssh::upload_config_if_missing(ssh_command, &encoded).await?;
+    }
+
+    progress("service", "Ensuring the per-user background service is available");
+    let output = ssh::run(
         ssh_command,
         r#"exec "$HOME/.local/bin/ssh-clipboard" service install --binary "$HOME/.local/bin/ssh-clipboard""#,
     )
     .await?;
-    Ok(())
+    let detail = String::from_utf8(output)?;
+    service::InstallOutcome::from_detail(&detail)
+        .context("remote service installer returned an unexpected result")
+}
+
+pub async fn inspect_remote(ssh_command: &str, probe: &ProbeResult) -> Result<Installation> {
+    let token = format!("SCB_INSTALL_{}", Uuid::new_v4().simple());
+    let service = if probe.os == "darwin" {
+        "$HOME/Library/LaunchAgents/dev.ssh-clipboard.plist"
+    } else {
+        "$HOME/.config/systemd/user/ssh-clipboard.service"
+    };
+    let remote = format!(
+        r#"version=''; running=0; if [ -x "$HOME/.local/bin/ssh-clipboard" ]; then version=$("$HOME/.local/bin/ssh-clipboard" --version 2>/dev/null || true); version="${{version#ssh-clipboard }}"; "$HOME/.local/bin/ssh-clipboard" status --json >/dev/null 2>&1 && running=1; fi; config=0; [ -f "$HOME/.config/ssh-clipboard/config.json" ] && config=1; service=0; [ -f "{service}" ] && service=1; printf '{token}\t%s\t%s\t%s\t%s\n' "$version" "$config" "$service" "$running""#
+    );
+    let output = String::from_utf8(ssh::run(ssh_command, &remote).await?)?;
+    parse_installation(&output, &token)
+}
+
+fn parse_installation(output: &str, token: &str) -> Result<Installation> {
+    let line = output
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{token}\t")))
+        .context("installation inspection returned no result")?;
+    let mut fields = line.split('\t');
+    let version = fields
+        .next()
+        .filter(|version| !version.trim().is_empty())
+        .map(str::to_owned);
+    let config_exists = parse_flag(fields.next(), "config")?;
+    let service_exists = parse_flag(fields.next(), "service")?;
+    let running = parse_flag(fields.next(), "running")?;
+    if fields.next().is_some() {
+        bail!("installation inspection returned unexpected fields");
+    }
+    Ok(Installation {
+        version,
+        config_exists,
+        service_exists,
+        running,
+    })
+}
+
+fn parse_flag(value: Option<&str>, name: &str) -> Result<bool> {
+    match value {
+        Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => bail!("installation inspection returned an invalid {name} flag"),
+        None => bail!("installation inspection omitted the {name} flag"),
+    }
 }
 
 pub async fn install_local_binary(source: Option<&Path>) -> Result<PathBuf> {
@@ -95,9 +211,35 @@ pub async fn install_local_binary(source: Option<&Path>) -> Result<PathBuf> {
     Ok(destination)
 }
 
-pub async fn install_local_service() -> Result<()> {
-    let binary = install_local_binary(None).await?;
+pub async fn install_local_service() -> Result<service::InstallOutcome> {
+    let destination = paths()?.binary;
+    let installed = binary_version(&destination).await;
+    let binary = if installed.as_deref() == Some(CURRENT_VERSION)
+        || installed
+            .as_deref()
+            .is_some_and(|version| update::newer_version(CURRENT_VERSION, version))
+    {
+        destination
+    } else {
+        install_local_binary(None).await?
+    };
     service::install(&binary).await
+}
+
+async fn binary_version(binary: &Path) -> Option<String> {
+    let output = tokio::process::Command::new(binary)
+        .arg("--version")
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .strip_prefix("ssh-clipboard ")
+        .map(str::to_owned)
 }
 
 pub async fn restore_previous_binary() -> Result<PathBuf> {
@@ -169,5 +311,53 @@ mod tests {
             candidates[1],
             PathBuf::from("/app/vendor/ssh-clipboard-linux-amd64")
         );
+    }
+
+    #[test]
+    fn parses_existing_installations_without_losing_state() {
+        let output = format!("banner\nTOKEN\t{CURRENT_VERSION}\t1\t1\t1\n");
+        let installation = parse_installation(&output, "TOKEN").unwrap();
+        assert_eq!(
+            installation,
+            Installation {
+                version: Some(CURRENT_VERSION.into()),
+                config_exists: true,
+                service_exists: true,
+                running: true,
+            }
+        );
+        assert!(!installation.needs_binary());
+        assert_eq!(
+            installation.summary(),
+            format!("Already installed and running · v{CURRENT_VERSION}")
+        );
+    }
+
+    #[test]
+    fn older_and_missing_installations_receive_the_current_binary() {
+        assert!(
+            Installation {
+                version: Some("0.1.2".into()),
+                config_exists: true,
+                service_exists: true,
+                running: true,
+            }
+            .needs_binary()
+        );
+        assert!(
+            Installation {
+                version: None,
+                config_exists: false,
+                service_exists: false,
+                running: false,
+            }
+            .needs_binary()
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_installation_inspection() {
+        let error = parse_installation("TOKEN\t0.2.1\t1\n", "TOKEN").unwrap_err();
+        assert!(error.to_string().contains("service flag"));
     }
 }

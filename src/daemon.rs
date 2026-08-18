@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -39,6 +40,8 @@ pub struct Status {
     pub version: String,
     #[serde(default = "legacy_version")]
     pub desired_version: String,
+    #[serde(default)]
+    pub configured_peers: Vec<String>,
     pub connected_peers: Vec<String>,
     #[serde(default)]
     pub peers: Vec<PeerStatus>,
@@ -147,6 +150,7 @@ impl Daemon {
         writer: &mut W,
         label: &str,
         mut shutdown: watch::Receiver<bool>,
+        established: Option<&AtomicBool>,
     ) -> Result<()>
     where
         R: AsyncRead + Unpin,
@@ -192,6 +196,9 @@ impl Daemon {
             },
         );
         info!(peer = %node_name, %node_id, version = ?app_version, %label, "peer connected");
+        if let Some(established) = established {
+            established.store(true, Ordering::Release);
+        }
 
         let result = loop {
             tokio::select! {
@@ -309,6 +316,14 @@ impl Daemon {
 
     async fn status(&self) -> Status {
         let peers = self.peers.read().await;
+        let mut configured_peers = self
+            .config
+            .peers
+            .iter()
+            .map(|peer| peer.name.clone())
+            .collect::<Vec<_>>();
+        configured_peers.sort();
+        configured_peers.dedup();
         let mut connected_peers = peers.values().map(|peer| peer.name.clone()).collect::<Vec<_>>();
         connected_peers.sort();
         connected_peers.dedup();
@@ -330,6 +345,7 @@ impl Daemon {
             clipboard_backend: self.clipboard.name().to_owned(),
             version: CURRENT_VERSION.to_owned(),
             desired_version: self.desired_version.borrow().clone(),
+            configured_peers,
             connected_peers,
             peers: peer_statuses,
         }
@@ -359,7 +375,10 @@ pub async fn run(config: Config) -> Result<()> {
         tokio::select! {
             () = shutdown_signal() => {}
             version = update::run_auto_updates(update_desired, hint_receiver) => {
-                info!(%version, "automatic update installed; restarting daemon");
+                info!(%version, "automatic update installed; requesting an explicit service restart");
+                if let Err(error) = crate::service::control(crate::service::Action::Restart).await {
+                    warn!(%error, %version, "explicit service restart failed; falling back to a clean daemon exit");
+                }
             }
         }
     };
@@ -451,7 +470,7 @@ async fn handle_local(
             // arrive in one socket read, and `into_inner` would discard those bytes.
             let (mut reader, mut writer) = tokio::io::split(buffered);
             daemon
-                .serve_peer(&mut reader, &mut writer, "incoming SSH", shutdown)
+                .serve_peer(&mut reader, &mut writer, "incoming SSH", shutdown, None)
                 .await
         }
         "MONITOR" => serve_monitor(daemon, buffered.into_inner(), shutdown).await,
@@ -494,23 +513,33 @@ async fn serve_monitor(
 async fn dial_loop(daemon: Arc<Daemon>, peer: PeerConfig, mut shutdown: watch::Receiver<bool>) {
     let mut backoff = Duration::from_secs(1);
     loop {
+        let established = AtomicBool::new(false);
         let result = async {
             let mut child = ssh::start_bridge(&peer.ssh_command)?;
             let mut writer = child.stdin.take().context("SSH bridge stdin unavailable")?;
             let mut reader = child.stdout.take().context("SSH bridge stdout unavailable")?;
             let result = Arc::clone(&daemon)
-                .serve_peer(&mut reader, &mut writer, &peer.name, shutdown.clone())
+                .serve_peer(
+                    &mut reader,
+                    &mut writer,
+                    &peer.name,
+                    shutdown.clone(),
+                    Some(&established),
+                )
                 .await;
             let _ = child.kill().await;
             result
         }
         .await;
+        if established.load(Ordering::Acquire) {
+            backoff = Duration::from_secs(1);
+        }
         if let Err(error) = result {
             warn!(peer = %peer.name, %error, "peer connection failed");
         }
         tokio::select! {
             () = tokio::time::sleep(backoff) => {
-                backoff = (backoff * 2).min(Duration::from_secs(30));
+                backoff = (backoff * 2).min(Duration::from_secs(10));
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -616,6 +645,7 @@ mod tests {
 
         assert_eq!(status.version, "legacy");
         assert_eq!(status.desired_version, "legacy");
+        assert!(status.configured_peers.is_empty());
         assert!(status.peers.is_empty());
     }
 
@@ -673,7 +703,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
             daemon
-                .serve_peer(&mut reader, &mut writer, "test", shutdown_rx)
+                .serve_peer(&mut reader, &mut writer, "test", shutdown_rx, None)
                 .await
         });
         assert!(matches!(
@@ -738,13 +768,13 @@ mod tests {
         let shutdown_a = shutdown_rx.clone();
         tokio::spawn(async move {
             daemon_a
-                .serve_peer(&mut server_a_read, &mut server_a_write, "a", shutdown_a)
+                .serve_peer(&mut server_a_read, &mut server_a_write, "a", shutdown_a, None)
                 .await
         });
         let daemon_b = Arc::clone(&daemon);
         tokio::spawn(async move {
             daemon_b
-                .serve_peer(&mut server_b_read, &mut server_b_write, "b", shutdown_rx)
+                .serve_peer(&mut server_b_read, &mut server_b_write, "b", shutdown_rx, None)
                 .await
         });
         let (mut a_read, mut a_write) = split(peer_a);
