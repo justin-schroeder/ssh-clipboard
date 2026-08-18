@@ -139,13 +139,13 @@ impl SetupApp {
     fn on_entry_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Enter => {
-                let command = self.input.trim().to_owned();
-                if command.is_empty() {
+                if self.input.trim().is_empty() {
                     if !self.peers.is_empty() {
                         self.begin_install();
                     }
                     return;
                 }
+                let command = ssh::normalize_command(&self.input);
                 self.error = None;
                 self.stage = Stage::Verifying;
                 let sender = self.sender.clone();
@@ -317,18 +317,18 @@ impl SetupApp {
             ]),
             Stage::Entry => {
                 let visible = if self.input.is_empty() {
-                    Span::styled("macbookserver   or   ssh user@host", Style::new().fg(MUTED))
+                    Span::styled("ssh macbookserver   or   ssh user@host", Style::new().fg(MUTED))
                 } else {
                     Span::styled(clean_truncate(&self.input, 74), Style::new().fg(SOFT))
                 };
                 let mut lines = vec![
                     Line::styled(
-                        "Use the exact SSH command that already connects without prompting.",
+                        "Paste your working SSH command, or just enter its host.",
                         Style::new().fg(MUTED),
                     ),
                     Line::raw(""),
                     Line::from(vec![
-                        Span::styled(" ssh  ", Style::new().fg(CYAN).bold()),
+                        Span::styled(" command  ", Style::new().fg(CYAN).bold()),
                         visible,
                         Span::styled("▏", Style::new().fg(CYAN)),
                     ]),
@@ -577,5 +577,24 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Couldn’t verify"));
         assert!(!rendered.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn entry_screen_shows_a_complete_command_without_a_fake_prefix() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut app = SetupApp::new(runtime.handle().clone(), Config::default());
+        app.stage = Stage::Entry;
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("command  ssh macbookserver"));
+        assert!(!rendered.contains("ssh  macbookserver"));
     }
 }

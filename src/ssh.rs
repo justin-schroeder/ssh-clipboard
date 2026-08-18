@@ -28,6 +28,20 @@ pub struct ProbeResult {
     pub hostname: String,
 }
 
+#[must_use]
+pub fn normalize_command(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let is_ssh_command = shell_words::split(trimmed)
+        .ok()
+        .and_then(|words| words.into_iter().next())
+        .is_some_and(|program| Path::new(&program).file_name().and_then(|name| name.to_str()) == Some("ssh"));
+    if is_ssh_command {
+        trimmed.to_owned()
+    } else {
+        format!("ssh {trimmed}")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ParsedCommand {
     program: PathBuf,
@@ -230,6 +244,14 @@ mod tests {
         let parsed = parse_command(r#"ssh -i "/Users/me/My Key" -p 2222 person@example.com"#).unwrap();
         assert_eq!(parsed.program, PathBuf::from("ssh"));
         assert_eq!(parsed.arguments.last().unwrap(), "person@example.com");
+    }
+
+    #[test]
+    fn normalizes_hosts_and_preserves_full_commands() {
+        assert_eq!(normalize_command("macbookserver"), "ssh macbookserver");
+        assert_eq!(normalize_command(" user@example.com "), "ssh user@example.com");
+        assert_eq!(normalize_command("ssh -p 2222 server"), "ssh -p 2222 server");
+        assert_eq!(normalize_command("/usr/bin/ssh server"), "/usr/bin/ssh server");
     }
 
     #[test]
