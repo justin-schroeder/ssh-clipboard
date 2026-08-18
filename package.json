@@ -32,7 +32,11 @@
   },
   "scripts": {
     "test": "node --test npm-tests/*.test.mjs",
+    "release": "node scripts/release.mjs",
+    "release:dev": "node scripts/release.mjs --tag=dev",
+    "release:nightly": "node scripts/release.mjs --tag=nightly",
     "stage:binaries": "node scripts/stage-npm-binaries.mjs",
+    "version:check": "node scripts/check-version.mjs",
     "verify:binaries": "node scripts/verify-npm-binaries.mjs",
     "prepack": "npm run verify:binaries"
   },
@@ -47,5 +51,8 @@
     "tmux",
     "macos",
     "linux"
-  ]
+  ],
+  "devDependencies": {
+    "@clack/prompts": "^1.7.0"
+  }
 }

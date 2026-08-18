@@ -4,11 +4,66 @@ on:
   push:
     tags: ['v*']
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
 jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    outputs:
+      dist-tag: ${{ steps.meta.outputs.dist_tag }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+      - name: Parse release tag
+        id: meta
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          if [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            {
+              echo "version=$TAG"
+              echo "dist_tag=latest"
+              echo "prerelease=false"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+-([a-z][a-z0-9-]*)\.([0-9a-f]+)$ ]]; then
+            {
+              echo "version=$TAG"
+              echo "dist_tag=${BASH_REMATCH[1]}"
+              echo "prerelease=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::error::Use vX.Y.Z or vX.Y.Z-<dist-tag>.<commit-hash>."
+          exit 1
+      - name: Require stable releases from main
+        if: steps.meta.outputs.prerelease == 'false'
+        run: |
+          git fetch origin main --depth=1
+          git merge-base --is-ancestor HEAD origin/main || {
+            echo "::error::Stable release tags must reference a commit on main."
+            exit 1
+          }
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Require tag and source versions to match
+        run: npm run version:check -- "${{ steps.meta.outputs.version }}"
+
   binary:
+    needs: metadata
     strategy:
       fail-fast: false
       matrix:
@@ -50,7 +105,7 @@ jobs:
           path: ssh-clipboard-bundle.tar.gz
 
   npm-package:
-    needs: binary
+    needs: [metadata, binary]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -73,13 +128,16 @@ jobs:
 
   publish-npm:
     if: vars.NPM_PUBLISH == 'true'
-    needs: npm-package
+    needs: [metadata, npm-package]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -89,4 +147,16 @@ jobs:
         with:
           name: ssh-clipboard-npm
           path: package
-      - run: npm publish package/ssh-clipboard-*.tgz --access public --provenance
+      - name: Publish through npm trusted publishing
+        shell: bash
+        run: |
+          PACKAGE=ssh-clipboard
+          VERSION="${{ needs.metadata.outputs.version }}"
+          if npm view "$PACKAGE@$VERSION" version >/dev/null 2>&1; then
+            echo "$PACKAGE@$VERSION is already published."
+          else
+            npm publish package/ssh-clipboard-*.tgz \
+              --access public \
+              --provenance \
+              --tag "${{ needs.metadata.outputs.dist-tag }}"
+          fi

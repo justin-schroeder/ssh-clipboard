@@ -30,6 +30,19 @@ The `ssh-clipboard` package name is reserved in the public npm registry by the `
 
 Configure npm trusted publishing for this GitHub repository and `.github/workflows/release.yml`, then set the GitHub repository variable `NPM_PUBLISH=true`. Version tags will build, verify, package, and publish through short-lived OIDC credentials with npm provenance; no long-lived npm token is stored in GitHub.
 
+Releases must go through the repository helper rather than a hand-written tag:
+
+```sh
+npm run release                 # interactive stable release → npm @latest
+npm run release -- patch --yes # explicit/non-interactive stable release
+npm run release:dev -- patch   # vX.Y.Z-dev.<hash> → npm @dev
+npm run release:nightly -- patch
+npm run release -- --tag=next  # any lowercase named prerelease channel
+npm run release -- --dry-run   # run every gate without changing Git or versions
+```
+
+Stable releases update the Rust manifest/lockfile and npm manifest/lockfile together, commit the version to `main`, create `vX.Y.Z`, and push the branch and tag. Prereleases use a temporary local branch, push only `vX.Y.Z-<dist-tag>.<commit-hash>`, and leave `main` on its stable version. The workflow derives the npm dist-tag from the Git tag, verifies all four source versions, builds all four native targets, validates their executable headers and checksums, and publishes idempotently through npm OIDC.
+
 The repository metadata in `package.json` must exactly match the public GitHub repository for npm provenance. It is set to `justin-schroeder/ssh-clipboard`. The version in `package.json` and `Cargo.toml` must match the release tag.
 
 ## macOS signing
