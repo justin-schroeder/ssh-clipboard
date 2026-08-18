@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use ssh_clipboard::config::{Config, paths};
 use ssh_clipboard::daemon;
 use ssh_clipboard::model::{Direction, MonitorEvent, human_bytes};
-use ssh_clipboard::{service, tui, update};
+use ssh_clipboard::{deploy, service, tui, update};
 use tokio::io::AsyncBufReadExt;
 
 #[derive(Parser)]
@@ -139,12 +139,13 @@ async fn run() -> Result<()> {
                 return Ok(());
             }
             if let Some(version) = update::update_now().await? {
-                println!("installed {version}; restarting service");
-                service::control(service::Action::Restart).await
+                println!("installed {version}; reconciling service");
             } else {
                 println!("no newer stable release than {}", update::CURRENT_VERSION);
-                Ok(())
             }
+            let outcome = deploy::install_local_service().await?;
+            println!("{}", outcome.detail());
+            Ok(())
         }
         Some(Command::Service { action }) => match action {
             ServiceAction::Install { binary } => {
