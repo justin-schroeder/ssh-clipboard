@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
@@ -31,6 +31,7 @@ struct MonitorApp {
     config: Config,
     receiver: Receiver<UiMessage>,
     status: Option<Status>,
+    machine_names: HashMap<String, String>,
     events: VecDeque<MonitorEvent>,
     error: Option<String>,
     paused: bool,
@@ -45,6 +46,7 @@ impl MonitorApp {
             config,
             receiver,
             status: None,
+            machine_names: HashMap::new(),
             events: VecDeque::new(),
             error: None,
             paused: false,
@@ -96,6 +98,11 @@ impl MonitorApp {
                 self.events.truncate(200);
             }
             UiMessage::Status(status) => {
+                for peer in &status.peers {
+                    if let Some(machine_name) = peer.machine_name.as_ref().filter(|name| !name.is_empty()) {
+                        self.machine_names.insert(peer.name.clone(), machine_name.clone());
+                    }
+                }
                 self.status = Some(status);
                 self.error = None;
             }
@@ -190,9 +197,19 @@ impl MonitorApp {
         }
         peer_names.sort();
         let desired_version = self.status.as_ref().map(|status| status.desired_version.as_str());
+        let local_name = self.status.as_ref().map_or_else(
+            || self.config.node_name.as_str(),
+            |status| {
+                if status.machine_name.is_empty() {
+                    status.node_name.as_str()
+                } else {
+                    status.machine_name.as_str()
+                }
+            },
+        );
         let mut spans = vec![
             Span::styled("● ", Style::new().fg(GREEN)),
-            Span::styled(self.config.node_name.clone(), Style::new().fg(SOFT).bold()),
+            Span::styled(local_name.to_owned(), Style::new().fg(SOFT).bold()),
             Span::styled("  this machine", Style::new().fg(MUTED)),
         ];
         for peer in peer_names {
@@ -204,6 +221,11 @@ impl MonitorApp {
                 .and_then(|status| status.peers.iter().find(|status| status.name == peer));
             let peer_version = peer_status.and_then(|status| status.version.as_deref());
             let peer_desired = peer_status.and_then(|status| status.desired_version.as_deref());
+            let peer_label = peer_status
+                .and_then(|status| status.machine_name.as_deref())
+                .filter(|name| !name.is_empty())
+                .or_else(|| self.machine_names.get(&peer).map(String::as_str))
+                .unwrap_or(&peer);
             let is_current = is_connected
                 && peer_version.is_some_and(|version| Some(version) == desired_version)
                 && peer_desired.is_none_or(|version| Some(version) == desired_version);
@@ -218,7 +240,7 @@ impl MonitorApp {
                 if is_connected { "● " } else { "○ " },
                 Style::new().fg(color),
             ));
-            spans.push(Span::styled(peer, Style::new().fg(SOFT).bold()));
+            spans.push(Span::styled(peer_label.to_owned(), Style::new().fg(SOFT).bold()));
             spans.push(Span::styled(
                 if !is_connected {
                     "  reconnecting".to_owned()
@@ -490,6 +512,7 @@ mod tests {
             running: true,
             node_id: config.node_id,
             node_name: config.node_name,
+            machine_name: "local-machine.local".into(),
             clipboard_backend: "NSPasteboard".into(),
             version: crate::update::CURRENT_VERSION.into(),
             desired_version: crate::update::CURRENT_VERSION.into(),
@@ -498,6 +521,7 @@ mod tests {
             peers: vec![crate::daemon::PeerStatus {
                 node_id: Uuid::new_v4(),
                 name: "server".into(),
+                machine_name: Some("server-machine.local".into()),
                 version: Some(crate::update::CURRENT_VERSION.into()),
                 desired_version: Some(crate::update::CURRENT_VERSION.into()),
             }],
@@ -527,7 +551,8 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(rendered.contains("● LIVE"));
-        assert!(rendered.contains("server  connected"));
+        assert!(rendered.contains("local-machine.local"));
+        assert!(rendered.contains("server-machine.local  connected"));
         assert!(rendered.contains("design.pdf"));
         assert!(rendered.contains("4.0 KiB"));
     }
@@ -544,6 +569,7 @@ mod tests {
             running: true,
             node_id: config.node_id,
             node_name: config.node_name,
+            machine_name: "local-machine.local".into(),
             clipboard_backend: "NSPasteboard".into(),
             version: crate::update::CURRENT_VERSION.into(),
             desired_version: crate::update::CURRENT_VERSION.into(),
@@ -586,6 +612,7 @@ mod tests {
             running: true,
             node_id: config.node_id,
             node_name: config.node_name,
+            machine_name: "local-machine.local".into(),
             clipboard_backend: "NSPasteboard".into(),
             version: crate::update::CURRENT_VERSION.into(),
             desired_version: "9.0.0".into(),
@@ -594,6 +621,7 @@ mod tests {
             peers: vec![crate::daemon::PeerStatus {
                 node_id: Uuid::new_v4(),
                 name: "server".into(),
+                machine_name: Some("server-machine.local".into()),
                 version: Some(crate::update::CURRENT_VERSION.into()),
                 desired_version: Some("9.0.0".into()),
             }],

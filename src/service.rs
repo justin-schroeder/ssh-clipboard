@@ -24,6 +24,13 @@ pub enum InstallOutcome {
     PendingLogin,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconcileAction {
+    None,
+    Start,
+    Restart,
+}
+
 impl InstallOutcome {
     #[must_use]
     pub const fn detail(self) -> &'static str {
@@ -60,11 +67,12 @@ pub async fn install(binary: &Path) -> Result<InstallOutcome> {
     } else {
         bail!("background services are supported on macOS and Linux");
     };
+    let already_healthy = check_health(&paths.socket, &expected_version).await.is_ok();
     write_atomic(&paths.service, contents.as_bytes()).await?;
     let outcome = if cfg!(target_os = "macos") {
-        start_macos(&paths.service).await
+        start_macos(&paths.service, already_healthy).await
     } else {
-        start_linux().await
+        start_linux(already_healthy).await
     }?;
     if outcome == InstallOutcome::Running {
         wait_until_healthy(&paths.socket, &expected_version).await?;
@@ -131,33 +139,41 @@ WantedBy=default.target
     )
 }
 
-async fn start_macos(service_path: &Path) -> Result<InstallOutcome> {
+async fn start_macos(service_path: &Path, already_healthy: bool) -> Result<InstallOutcome> {
     let domain = format!("gui/{}", uid().await?);
     if !command_succeeds("launchctl", &["print", &domain]).await? {
         return Ok(InstallOutcome::PendingLogin);
     }
 
     let service = format!("{domain}/{LABEL}");
-    if !command_succeeds("launchctl", &["print", &service]).await? {
-        let bootstrap = run(
-            "launchctl",
-            &["bootstrap", &domain, &service_path.display().to_string()],
-        )
-        .await;
-        if let Err(error) = bootstrap
-            && !command_succeeds("launchctl", &["print", &service]).await?
-        {
-            return Err(error).context("install LaunchAgent");
+    let loaded = command_succeeds("launchctl", &["print", &service]).await?;
+    match reconcile_action(loaded, already_healthy) {
+        ReconcileAction::None => {}
+        ReconcileAction::Start => {
+            let bootstrap = run(
+                "launchctl",
+                &["bootstrap", &domain, &service_path.display().to_string()],
+            )
+            .await;
+            if let Err(error) = bootstrap
+                && !command_succeeds("launchctl", &["print", &service]).await?
+            {
+                return Err(error).context("install LaunchAgent");
+            }
+            // RunAtLoad starts a newly bootstrapped job. Killing it here would
+            // trigger launchd's minimum-runtime throttle and create avoidable
+            // clipboard downtime.
+        }
+        ReconcileAction::Restart => {
+            run("launchctl", &["kickstart", "-k", &service])
+                .await
+                .context("restart LaunchAgent")?;
         }
     }
-
-    run("launchctl", &["kickstart", "-k", &service])
-        .await
-        .context("start LaunchAgent")?;
     Ok(InstallOutcome::Running)
 }
 
-async fn start_linux() -> Result<InstallOutcome> {
+async fn start_linux(already_healthy: bool) -> Result<InstallOutcome> {
     if !command_succeeds("systemctl", &["--user", "show-environment"]).await? {
         return Ok(InstallOutcome::PendingLogin);
     }
@@ -174,12 +190,30 @@ async fn start_linux() -> Result<InstallOutcome> {
     )
     .await;
     run("systemctl", &["--user", "daemon-reload"]).await?;
-    run(
+    run("systemctl", &["--user", "enable", "ssh-clipboard.service"]).await?;
+    let active = command_succeeds(
         "systemctl",
-        &["--user", "enable", "--now", "ssh-clipboard.service"],
+        &["--user", "is-active", "--quiet", "ssh-clipboard.service"],
     )
     .await?;
+    match reconcile_action(active, already_healthy) {
+        ReconcileAction::None => {}
+        ReconcileAction::Start => {
+            run("systemctl", &["--user", "start", "ssh-clipboard.service"]).await?;
+        }
+        ReconcileAction::Restart => {
+            run("systemctl", &["--user", "restart", "ssh-clipboard.service"]).await?;
+        }
+    }
     Ok(InstallOutcome::Running)
+}
+
+const fn reconcile_action(loaded: bool, healthy: bool) -> ReconcileAction {
+    match (loaded, healthy) {
+        (true, true) => ReconcileAction::None,
+        (true, false) => ReconcileAction::Restart,
+        (false, _) => ReconcileAction::Start,
+    }
 }
 
 async fn uid() -> Result<String> {
@@ -232,46 +266,36 @@ async fn binary_version(binary: &Path) -> Result<String> {
 async fn wait_until_healthy(socket: &Path, expected_version: &str) -> Result<()> {
     let mut last_error = None;
     for _ in 0..40 {
-        match UnixStream::connect(socket).await {
-            Ok(mut stream) => {
-                if let Err(error) = stream.write_all(b"STATUS\n").await {
-                    last_error = Some(error.into());
-                } else {
-                    let mut response = String::new();
-                    match tokio::time::timeout(
-                        Duration::from_millis(500),
-                        BufReader::new(stream).read_line(&mut response),
-                    )
-                    .await
-                    {
-                        Ok(Ok(read))
-                            if read > 0
-                                && serde_json::from_str::<serde_json::Value>(&response).is_ok_and(
-                                    |status| {
-                                        status.get("running").and_then(serde_json::Value::as_bool)
-                                            == Some(true)
-                                            && status.get("version").and_then(serde_json::Value::as_str)
-                                                == Some(expected_version)
-                                    },
-                                ) =>
-                        {
-                            return Ok(());
-                        }
-                        Ok(Ok(_)) => {
-                            last_error =
-                                Some(anyhow::anyhow!("daemon returned an empty or unhealthy status"));
-                        }
-                        Ok(Err(error)) => last_error = Some(error.into()),
-                        Err(error) => last_error = Some(error.into()),
-                    }
-                }
-            }
-            Err(error) => last_error = Some(error.into()),
+        match check_health(socket, expected_version).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("daemon did not create its status socket")))
         .context("background service did not become healthy")
+}
+
+async fn check_health(socket: &Path, expected_version: &str) -> Result<()> {
+    let mut stream = UnixStream::connect(socket).await?;
+    stream.write_all(b"STATUS\n").await?;
+    let mut response = String::new();
+    let read = tokio::time::timeout(
+        Duration::from_millis(500),
+        BufReader::new(stream).read_line(&mut response),
+    )
+    .await??;
+    if read == 0 {
+        bail!("daemon returned an empty status");
+    }
+    let status: serde_json::Value = serde_json::from_str(&response)?;
+    if status.get("running").and_then(serde_json::Value::as_bool) != Some(true) {
+        bail!("daemon reported that it is not running");
+    }
+    if status.get("version").and_then(serde_json::Value::as_str) != Some(expected_version) {
+        bail!("daemon is not running the expected version {expected_version}");
+    }
+    Ok(())
 }
 
 async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -311,6 +335,14 @@ mod tests {
         for outcome in [InstallOutcome::Running, InstallOutcome::PendingLogin] {
             assert_eq!(InstallOutcome::from_detail(outcome.detail()), Some(outcome));
         }
+    }
+
+    #[test]
+    fn service_reconciliation_avoids_unnecessary_or_double_restarts() {
+        assert_eq!(reconcile_action(true, true), ReconcileAction::None);
+        assert_eq!(reconcile_action(true, false), ReconcileAction::Restart);
+        assert_eq!(reconcile_action(false, false), ReconcileAction::Start);
+        assert_eq!(reconcile_action(false, true), ReconcileAction::Start);
     }
 
     #[tokio::test]

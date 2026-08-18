@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::clipboard::{ClipboardBackend, NativeClipboard};
-use crate::config::{Config, PeerConfig, ensure_private_dir, paths};
+use crate::config::{Config, PeerConfig, detected_machine_name, ensure_private_dir, paths};
 use crate::filebundle;
 use crate::model::{Clip, Direction, MonitorEvent};
 use crate::protocol::{Message, read_message, write_clip, write_message};
@@ -26,6 +26,8 @@ use crate::update::{self, CURRENT_VERSION};
 pub struct PeerStatus {
     pub node_id: Uuid,
     pub name: String,
+    #[serde(default)]
+    pub machine_name: Option<String>,
     pub version: Option<String>,
     pub desired_version: Option<String>,
 }
@@ -35,6 +37,8 @@ pub struct Status {
     pub running: bool,
     pub node_id: Uuid,
     pub node_name: String,
+    #[serde(default)]
+    pub machine_name: String,
     pub clipboard_backend: String,
     #[serde(default = "legacy_version")]
     pub version: String,
@@ -54,6 +58,7 @@ fn legacy_version() -> String {
 struct PeerLink {
     node_id: Uuid,
     name: String,
+    machine_name: Option<String>,
     version: Option<String>,
     desired_version: Option<String>,
     send: watch::Sender<Option<Arc<Clip>>>,
@@ -61,6 +66,7 @@ struct PeerLink {
 
 struct Daemon {
     config: Config,
+    machine_name: String,
     clipboard: Arc<dyn ClipboardBackend>,
     peers: RwLock<HashMap<Uuid, PeerLink>>,
     seen: Mutex<HashMap<Uuid, Instant>>,
@@ -87,6 +93,7 @@ impl Daemon {
     ) -> Arc<Self> {
         let (events, _) = broadcast::channel(256);
         Arc::new(Self {
+            machine_name: detected_machine_name(),
             config,
             clipboard,
             peers: RwLock::new(HashMap::new()),
@@ -162,6 +169,7 @@ impl Daemon {
             &Message::Hello {
                 node_id: self.config.node_id,
                 node_name: self.config.node_name.clone(),
+                machine_name: Some(self.machine_name.clone()),
                 app_version: Some(CURRENT_VERSION.to_owned()),
                 desired_version: Some(desired_version),
             },
@@ -171,6 +179,7 @@ impl Daemon {
         let Message::Hello {
             node_id,
             node_name,
+            machine_name,
             app_version,
             desired_version,
         } = read_message(reader, self.config.max_bytes).await?
@@ -190,6 +199,7 @@ impl Daemon {
             PeerLink {
                 node_id,
                 name: node_name.clone(),
+                machine_name: machine_name.clone(),
                 version: app_version.clone(),
                 desired_version: desired_version.clone(),
                 send: sender,
@@ -332,6 +342,7 @@ impl Daemon {
             .map(|peer| PeerStatus {
                 node_id: peer.node_id,
                 name: peer.name.clone(),
+                machine_name: peer.machine_name.clone(),
                 version: peer.version.clone(),
                 desired_version: peer.desired_version.clone(),
             })
@@ -342,6 +353,7 @@ impl Daemon {
             running: true,
             node_id: self.config.node_id,
             node_name: self.config.node_name.clone(),
+            machine_name: self.machine_name.clone(),
             clipboard_backend: self.clipboard.name().to_owned(),
             version: CURRENT_VERSION.to_owned(),
             desired_version: self.desired_version.borrow().clone(),
@@ -645,6 +657,7 @@ mod tests {
 
         assert_eq!(status.version, "legacy");
         assert_eq!(status.desired_version, "legacy");
+        assert!(status.machine_name.is_empty());
         assert!(status.configured_peers.is_empty());
         assert!(status.peers.is_empty());
     }
@@ -662,6 +675,7 @@ mod tests {
             &Message::Hello {
                 node_id: Uuid::new_v4(),
                 node_name: "remote-mac".into(),
+                machine_name: Some("remote-mac.local".into()),
                 app_version: Some(CURRENT_VERSION.into()),
                 desired_version: Some(CURRENT_VERSION.into()),
             },
@@ -715,6 +729,7 @@ mod tests {
             &Message::Hello {
                 node_id: Uuid::new_v4(),
                 node_name: "peer".into(),
+                machine_name: Some("peer.local".into()),
                 app_version: Some(CURRENT_VERSION.into()),
                 desired_version: Some(CURRENT_VERSION.into()),
             },
@@ -792,6 +807,7 @@ mod tests {
                 &Message::Hello {
                     node_id: Uuid::new_v4(),
                     node_name: name.into(),
+                    machine_name: Some(format!("{name}.local")),
                     app_version: Some(CURRENT_VERSION.into()),
                     desired_version: Some(CURRENT_VERSION.into()),
                 },

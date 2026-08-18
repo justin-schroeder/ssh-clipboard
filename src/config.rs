@@ -28,11 +28,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let node_name = hostname::get()
-            .ok()
-            .and_then(|hostname| hostname.into_string().ok())
-            .filter(|hostname| !hostname.trim().is_empty())
-            .unwrap_or_else(|| "unknown".to_owned());
+        let node_name = detected_machine_name();
         Self {
             version: CONFIG_VERSION,
             node_id: Uuid::new_v4(),
@@ -42,6 +38,15 @@ impl Default for Config {
             poll_interval_ms: 75,
         }
     }
+}
+
+#[must_use]
+pub fn detected_machine_name() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|hostname| hostname.into_string().ok())
+        .filter(|hostname| !hostname.trim().is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 impl Config {

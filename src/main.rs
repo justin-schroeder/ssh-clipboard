@@ -109,7 +109,14 @@ async fn run() -> Result<()> {
             } else {
                 println!(
                     "running as {} ({}, {}, version {})",
-                    status.node_name, status.node_id, status.clipboard_backend, status.version
+                    if status.machine_name.is_empty() {
+                        &status.node_name
+                    } else {
+                        &status.machine_name
+                    },
+                    status.node_id,
+                    status.clipboard_backend,
+                    status.version
                 );
                 if status.desired_version != status.version {
                     println!("updating to: {}", status.desired_version);

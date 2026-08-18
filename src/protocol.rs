@@ -33,6 +33,7 @@ pub enum Message {
     Hello {
         node_id: Uuid,
         node_name: String,
+        machine_name: Option<String>,
         app_version: Option<String>,
         desired_version: Option<String>,
     },
@@ -51,6 +52,8 @@ struct Header {
     node_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     node_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     app_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,6 +93,7 @@ where
         Message::Hello {
             node_id,
             node_name,
+            machine_name,
             app_version,
             desired_version,
         } => (
@@ -98,6 +102,7 @@ where
                 kind: Kind::Hello,
                 node_id: Some(*node_id),
                 node_name: Some(node_name.clone()),
+                machine_name: machine_name.clone(),
                 app_version: app_version.clone(),
                 desired_version: desired_version.clone(),
                 update_id: None,
@@ -114,6 +119,7 @@ where
                 kind: Kind::UpdateAvailable,
                 node_id: None,
                 node_name: None,
+                machine_name: None,
                 app_version: None,
                 desired_version: Some(version.clone()),
                 update_id: Some(*update_id),
@@ -141,6 +147,7 @@ where
         kind: Kind::Clip,
         node_id: None,
         node_name: None,
+        machine_name: None,
         app_version: None,
         desired_version: None,
         update_id: None,
@@ -213,6 +220,7 @@ where
                 .node_name
                 .filter(|name| !name.is_empty())
                 .ok_or(ProtocolError::InvalidMessage("hello is missing node_name"))?,
+            machine_name: header.machine_name.filter(|name| !name.trim().is_empty()),
             app_version: header.app_version,
             desired_version: header.desired_version,
         }),
@@ -313,6 +321,7 @@ mod tests {
         let hello = Message::Hello {
             node_id: Uuid::new_v4(),
             node_name: "laptop".into(),
+            machine_name: Some("actual-laptop.local".into()),
             app_version: Some("1.2.3".into()),
             desired_version: Some("1.3.0".into()),
         };
