@@ -20,7 +20,7 @@ Each daemon owns a mode-`0600` Unix socket. `ssh-clipboard bridge` contains no c
 4. File URL lists gain a private file bundle containing regular files/directories.
 5. A SHA-256 fingerprint detects unchanged clipboard snapshots.
 6. The event receives a UUID and is sent over every peer’s newest-value channel.
-7. The receiver deduplicates the UUID, relays it to other peers, materializes file bundles, and atomically publishes all safe representations.
+7. The receiver deduplicates the UUID, relays it to other peers, materializes file bundles, and atomically publishes all safe representations. On macOS, a received file selection is published as native `NSURL` pasteboard objects without a competing generic item, so Finder can paste it into any folder.
 8. The hash of the clipboard actually published by the OS suppresses the watcher echo.
 
 The protocol has an eight-byte prefix (`SCB1` plus a big-endian header length), a bounded JSON header, and raw representation bodies. Both header and aggregate body sizes are bounded before allocation.

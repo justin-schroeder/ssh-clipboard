@@ -54,11 +54,13 @@ pub fn attach_bundle(representations: &mut Vec<Representation>, max_remaining: u
     {
         return Ok(());
     }
-    let source_paths = representations
+    let mut source_paths = representations
         .iter()
         .filter(|representation| is_uri_format(&representation.format))
         .flat_map(|representation| parse_uri_list(&representation.data))
         .collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    source_paths.retain(|path| seen.insert(path.clone()));
     if source_paths.is_empty() {
         return Ok(());
     }
@@ -429,6 +431,42 @@ mod tests {
         let path = Path::new("/tmp/My 世界 #1.png");
         let uri = path_to_uri(path);
         assert_eq!(uri_to_path(&uri).unwrap(), path);
+    }
+
+    #[test]
+    fn overlapping_file_formats_do_not_duplicate_bundled_files() {
+        let source = tempfile::tempdir().unwrap();
+        let first = source.path().join("first.txt");
+        let second = source.path().join("second.txt");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        let first_uri = path_to_uri(&first);
+        let all_uris = format!("{first_uri}\r\n{}", path_to_uri(&second));
+        let mut representations = vec![
+            Representation {
+                item: 0,
+                format: "public.file-url".into(),
+                data: first_uri.into_bytes(),
+            },
+            Representation {
+                item: 0,
+                format: "text/uri-list".into(),
+                data: all_uris.into_bytes(),
+            },
+        ];
+
+        attach_bundle(&mut representations, 1024).unwrap();
+        let bundle = representations
+            .iter()
+            .find(|representation| representation.format == BUNDLE_FORMAT)
+            .unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let destination = target.path().join("decoded");
+        let files = decode(&bundle.data, &destination).unwrap();
+
+        assert_eq!(files.len(), 2);
+        assert_eq!(fs::read_to_string(&files[0]).unwrap(), "first");
+        assert_eq!(fs::read_to_string(&files[1]).unwrap(), "second");
     }
 
     #[test]

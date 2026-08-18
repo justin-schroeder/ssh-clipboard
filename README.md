@@ -27,7 +27,7 @@ The first-run TUI offers compatible online machines from Tailscale when it is in
 
 - **Native:** macOS pasteboard plus Linux Wayland/X11—not terminal escape tricks.
 - **Private:** persistent peer-to-peer SSH; no relay, account, port, or new encryption key.
-- **Faithful:** preserves every available representation, not only text or PNG.
+- **Faithful:** preserves every available representation, with native Finder file paste on macOS.
 - **Invisible:** Raycast and other clipboard managers see ordinary system clipboard writes.
 - **Fast:** raw bytes, persistent connections, deduplication, and newest-value queues.
 
