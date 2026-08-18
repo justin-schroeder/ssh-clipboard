@@ -14,9 +14,11 @@ Four persistent steps anchor the top of the screen:
 ● WELCOME ──── ○ PEERS ──── ○ INSTALL ──── ○ READY
 ```
 
-The welcome panel establishes three promises: no cloud account, no format conversion, starts at login. Peer entry accepts a whole SSH command and visibly states that password prompts are disabled. Verification becomes a focused progress state rather than freezing the form. Success shows hostname and OS/architecture, with one primary action (install) and one secondary action (add another).
+The welcome panel establishes three promises: no cloud account, no format conversion, starts at login. When Tailscale is available, peer entry presents compatible online macOS and Linux machines as a checklist while retaining the full SSH command field as a fallback. Verification becomes a focused progress state rather than freezing the form, and always confirms passwordless SSH plus the target architecture before installation. Success shows hostname and OS/architecture, with one primary action (install) and one secondary action (add another).
 
 Installation is a short checklist with peer name, current action, a progress bar, and a quiet performance note. Failures stay in context and offer an idempotent retry. The ready state explains that normal copy/paste and clipboard history now work; it does not invent a new interaction model.
+
+The monitor includes the running or desired release version beside the clipboard backend. Connected peers discovered through incoming bridges appear even when they are not present in this node's outbound configuration.
 
 ## Monitor
 

@@ -7,4 +7,6 @@ pub mod model;
 pub mod protocol;
 pub mod service;
 pub mod ssh;
+pub mod tailscale;
 pub mod tui;
+pub mod update;

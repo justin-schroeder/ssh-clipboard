@@ -9,7 +9,9 @@ vendor/linux-arm64/ssh-clipboard
 vendor/linux-amd64/ssh-clipboard
 ```
 
-The launcher maps Node's `process.platform` and `process.arch` to one executable, inherits the terminal unchanged for Ratatui, and forwards the native exit status. It also exports the vendor directory to the Rust process. First-run setup can therefore upload the correct native executable to a peer with a different OS or architecture. Installation and ordinary use never download executable code.
+The launcher maps Node's `process.platform` and `process.arch` to one executable, inherits the terminal unchanged for Ratatui, and forwards the native exit status. It also exports the vendor directory to the Rust process. First-run setup can therefore upload the correct native executable to a peer with a different OS or architecture.
+
+After installation, every daemon checks npm `@latest` independently. A newer stable package is downloaded only from the canonical npm tarball URL and must pass the registry SHA-512 integrity value, the package's per-target SHA-256 manifest, native executable-header validation, and an executed version check before atomic activation. `SSH_CLIPBOARD_DISABLE_AUTO_UPDATE=1` disables this behavior for development and controlled environments; `ssh-clipboard update --check` is always read-only.
 
 ## Building a package
 

@@ -165,32 +165,70 @@ impl MonitorApp {
             .as_ref()
             .map(|status| status.connected_peers.iter().cloned().collect::<HashSet<_>>())
             .unwrap_or_default();
+        let mut peer_names = self
+            .config
+            .peers
+            .iter()
+            .map(|peer| peer.name.clone())
+            .collect::<Vec<_>>();
+        for peer in &connected {
+            if !peer_names.contains(peer) {
+                peer_names.push(peer.clone());
+            }
+        }
+        peer_names.sort();
+        let desired_version = self.status.as_ref().map(|status| status.desired_version.as_str());
         let mut spans = vec![
             Span::styled("● ", Style::new().fg(GREEN)),
             Span::styled(self.config.node_name.clone(), Style::new().fg(SOFT).bold()),
             Span::styled("  this machine", Style::new().fg(MUTED)),
         ];
-        for peer in &self.config.peers {
+        for peer in peer_names {
             spans.push(Span::styled("     │     ", Style::new().fg(PANEL)));
-            let is_connected = connected.contains(&peer.name);
+            let is_connected = connected.contains(&peer);
+            let peer_version = self.status.as_ref().and_then(|status| {
+                status
+                    .peers
+                    .iter()
+                    .find(|status| status.name == peer)
+                    .and_then(|status| status.version.as_deref())
+            });
+            let is_current =
+                is_connected && peer_version.is_some_and(|version| Some(version) == desired_version);
+            let color = if is_current {
+                GREEN
+            } else if is_connected {
+                YELLOW
+            } else {
+                RED
+            };
             spans.push(Span::styled(
                 if is_connected { "● " } else { "○ " },
-                Style::new().fg(if is_connected { GREEN } else { RED }),
+                Style::new().fg(color),
             ));
-            spans.push(Span::styled(peer.name.clone(), Style::new().fg(SOFT).bold()));
+            spans.push(Span::styled(peer, Style::new().fg(SOFT).bold()));
             spans.push(Span::styled(
-                if is_connected {
-                    "  connected"
+                if !is_connected {
+                    "  reconnecting".to_owned()
+                } else if is_current {
+                    format!("  connected · v{}", peer_version.unwrap_or("legacy"))
                 } else {
-                    "  reconnecting"
+                    format!("  outdated · {}", peer_version.unwrap_or("legacy"))
                 },
-                Style::new().fg(MUTED),
+                Style::new().fg(if is_current { MUTED } else { color }),
             ));
         }
         let backend = self
             .status
             .as_ref()
             .map_or("detecting", |status| status.clipboard_backend.as_str());
+        let version = self.status.as_ref().map_or("detecting", |status| {
+            if status.version == status.desired_version {
+                status.version.as_str()
+            } else {
+                status.desired_version.as_str()
+            }
+        });
         let block = panel("  Peers  ");
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -201,6 +239,8 @@ impl MonitorApp {
                 Line::from(vec![
                     muted("backend "),
                     Span::styled(backend.to_owned(), Style::new().fg(SOFT)),
+                    muted("     version "),
+                    Span::styled(version.to_owned(), Style::new().fg(SOFT)),
                     muted("     sent "),
                     Span::styled(human_bytes(self.sent), Style::new().fg(SOFT)),
                     muted("     received "),
@@ -421,7 +461,15 @@ mod tests {
             node_id: config.node_id,
             node_name: config.node_name,
             clipboard_backend: "NSPasteboard".into(),
+            version: crate::update::CURRENT_VERSION.into(),
+            desired_version: crate::update::CURRENT_VERSION.into(),
             connected_peers: vec!["server".into()],
+            peers: vec![crate::daemon::PeerStatus {
+                node_id: Uuid::new_v4(),
+                name: "server".into(),
+                version: Some(crate::update::CURRENT_VERSION.into()),
+                desired_version: Some(crate::update::CURRENT_VERSION.into()),
+            }],
         }));
         app.on_message(UiMessage::Event(MonitorEvent {
             timestamp_millis: now_millis(),

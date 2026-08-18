@@ -32,3 +32,11 @@ macOS runs a user LaunchAgent in the GUI session so `NSPasteboard` is available.
 ## Multi-peer behavior
 
 An SSH stream is intrinsically bidirectional, so the remote does not need to SSH back. The machine whose configuration lists several peers relays between those direct streams. UUID deduplication prevents cycles; newest-value channels bound memory during bursts.
+
+## Decentralized updates
+
+Every daemon is an update participant. It checks npm's stable `latest` release every hour and immediately rechecks when a capable peer announces a newer desired version. The desired version is persisted locally and included in every protocol hello, so it survives restarts and reconnects instead of depending on a transient event or a permanent coordinator. Network partitions may perform redundant checks, but version state only advances and therefore converges safely.
+
+Peer announcements never authorize code by themselves. Each recipient retrieves the release metadata and tarball from the npm registry, verifies npm's SHA-512 integrity value, verifies its platform binary against the package's SHA-256 manifest and executable header, and executes the staged binary's `--version` check. The previous executable remains at `ssh-clipboard.previous`; the verified replacement is renamed atomically and the daemon exits cleanly so its existing launchd or systemd policy restarts it. Older peers remain protocol-compatible: their hellos omit application-version fields, and newer nodes do not send them update messages they cannot decode.
+
+The local bridge command and peer hello can arrive in one Unix-socket read. The socket command reader remains in the protocol path so bytes buffered beyond `BRIDGE\n` are never discarded.

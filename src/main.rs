@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use ssh_clipboard::config::{Config, paths};
 use ssh_clipboard::daemon;
 use ssh_clipboard::model::{Direction, MonitorEvent, human_bytes};
-use ssh_clipboard::{service, tui};
+use ssh_clipboard::{service, tui, update};
 use tokio::io::AsyncBufReadExt;
 
 #[derive(Parser)]
@@ -38,6 +38,12 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Check for and install the latest stable release
+    Update {
+        /// Report versions without installing
+        #[arg(long)]
+        check: bool,
+    },
     /// Manage the per-user background service
     Service {
         #[command(subcommand)]
@@ -47,6 +53,8 @@ enum Command {
     Daemon,
     #[command(hide = true)]
     Bridge,
+    #[command(hide = true)]
+    UpdateWatchdog { version: String },
 }
 
 #[derive(Subcommand)]
@@ -100,9 +108,12 @@ async fn run() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
                 println!(
-                    "running as {} ({}, {})",
-                    status.node_name, status.node_id, status.clipboard_backend
+                    "running as {} ({}, {}, version {})",
+                    status.node_name, status.node_id, status.clipboard_backend, status.version
                 );
+                if status.desired_version != status.version {
+                    println!("updating to: {}", status.desired_version);
+                }
                 if status.connected_peers.is_empty() {
                     println!("no peers connected");
                 } else {
@@ -110,8 +121,30 @@ async fn run() -> Result<()> {
                         println!("connected: {peer}");
                     }
                 }
+                for peer in status.peers {
+                    println!(
+                        "peer version: {} {}",
+                        peer.name,
+                        peer.version.as_deref().unwrap_or("legacy")
+                    );
+                }
             }
             Ok(())
+        }
+        Some(Command::Update { check }) => {
+            if check {
+                let latest = update::latest_version().await?;
+                println!("current: {}", update::CURRENT_VERSION);
+                println!("latest:  {latest}");
+                return Ok(());
+            }
+            if let Some(version) = update::update_now().await? {
+                println!("installed {version}; restarting service");
+                service::control(service::Action::Restart).await
+            } else {
+                println!("no newer stable release than {}", update::CURRENT_VERSION);
+                Ok(())
+            }
         }
         Some(Command::Service { action }) => match action {
             ServiceAction::Install { binary } => {
@@ -137,6 +170,7 @@ async fn run() -> Result<()> {
             daemon::run(Config::load()?).await
         }
         Some(Command::Bridge) => daemon::bridge().await,
+        Some(Command::UpdateWatchdog { version }) => update::watchdog(&version).await,
     }
 }
 

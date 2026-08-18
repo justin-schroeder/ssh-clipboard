@@ -82,6 +82,15 @@ pub async fn install_local_binary(source: Option<&Path>) -> Result<PathBuf> {
         use std::os::unix::fs::PermissionsExt;
         tokio::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755)).await?;
     }
+    if destination.is_file() {
+        let previous = PathBuf::from(format!("{}.previous", destination.display()));
+        tokio::fs::copy(&destination, &previous).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&previous, std::fs::Permissions::from_mode(0o700)).await?;
+        }
+    }
     tokio::fs::rename(&temporary, &destination).await?;
     Ok(destination)
 }
@@ -89,6 +98,23 @@ pub async fn install_local_binary(source: Option<&Path>) -> Result<PathBuf> {
 pub async fn install_local_service() -> Result<()> {
     let binary = install_local_binary(None).await?;
     service::install(&binary).await
+}
+
+pub async fn restore_previous_binary() -> Result<PathBuf> {
+    let destination = paths()?.binary;
+    let previous = PathBuf::from(format!("{}.previous", destination.display()));
+    if !previous.is_file() {
+        bail!("no previous ssh-clipboard binary is available");
+    }
+    let temporary = PathBuf::from(format!("{}.rollback", destination.display()));
+    tokio::fs::copy(&previous, &temporary).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755)).await?;
+    }
+    tokio::fs::rename(temporary, &destination).await?;
+    Ok(destination)
 }
 
 fn current_target() -> (&'static str, &'static str) {
@@ -102,6 +128,14 @@ fn current_target() -> (&'static str, &'static str) {
         other => other,
     };
     (os, arch)
+}
+
+pub fn current_target_name() -> Result<String> {
+    let (os, arch) = current_target();
+    if !matches!(os, "darwin" | "linux") || !matches!(arch, "arm64" | "amd64") {
+        bail!("unsupported current target {os}/{arch}");
+    }
+    Ok(format!("{os}-{arch}"))
 }
 
 #[cfg(test)]

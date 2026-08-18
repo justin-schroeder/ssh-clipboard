@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, RwLock, broadcast, watch};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -19,6 +19,15 @@ use crate::filebundle;
 use crate::model::{Clip, Direction, MonitorEvent};
 use crate::protocol::{Message, read_message, write_clip, write_message};
 use crate::ssh;
+use crate::update::{self, CURRENT_VERSION};
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerStatus {
+    pub node_id: Uuid,
+    pub name: String,
+    pub version: Option<String>,
+    pub desired_version: Option<String>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Status {
@@ -26,11 +35,24 @@ pub struct Status {
     pub node_id: Uuid,
     pub node_name: String,
     pub clipboard_backend: String,
+    #[serde(default = "legacy_version")]
+    pub version: String,
+    #[serde(default = "legacy_version")]
+    pub desired_version: String,
     pub connected_peers: Vec<String>,
+    #[serde(default)]
+    pub peers: Vec<PeerStatus>,
+}
+
+fn legacy_version() -> String {
+    "legacy".to_owned()
 }
 
 struct PeerLink {
+    node_id: Uuid,
     name: String,
+    version: Option<String>,
+    desired_version: Option<String>,
     send: watch::Sender<Option<Arc<Clip>>>,
 }
 
@@ -42,10 +64,24 @@ struct Daemon {
     suppressed: Mutex<HashMap<[u8; 32], usize>>,
     apply_lock: Mutex<()>,
     events: broadcast::Sender<MonitorEvent>,
+    desired_version: watch::Sender<String>,
+    update_hints: mpsc::UnboundedSender<String>,
 }
 
 impl Daemon {
+    #[cfg(test)]
     fn new(config: Config, clipboard: Arc<dyn ClipboardBackend>) -> Arc<Self> {
+        let (desired_version, _) = watch::channel(CURRENT_VERSION.to_owned());
+        let (update_hints, _) = mpsc::unbounded_channel();
+        Self::with_updates(config, clipboard, desired_version, update_hints)
+    }
+
+    fn with_updates(
+        config: Config,
+        clipboard: Arc<dyn ClipboardBackend>,
+        desired_version: watch::Sender<String>,
+        update_hints: mpsc::UnboundedSender<String>,
+    ) -> Arc<Self> {
         let (events, _) = broadcast::channel(256);
         Arc::new(Self {
             config,
@@ -55,6 +91,8 @@ impl Daemon {
             suppressed: Mutex::new(HashMap::new()),
             apply_lock: Mutex::new(()),
             events,
+            desired_version,
+            update_hints,
         })
     }
 
@@ -114,28 +152,46 @@ impl Daemon {
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
+        let desired_version = self.desired_version.borrow().clone();
         write_message(
             writer,
             &Message::Hello {
                 node_id: self.config.node_id,
                 node_name: self.config.node_name.clone(),
+                app_version: Some(CURRENT_VERSION.to_owned()),
+                desired_version: Some(desired_version),
             },
             self.config.max_bytes,
         )
         .await?;
-        let Message::Hello { node_id, node_name } = read_message(reader, self.config.max_bytes).await? else {
+        let Message::Hello {
+            node_id,
+            node_name,
+            app_version,
+            desired_version,
+        } = read_message(reader, self.config.max_bytes).await?
+        else {
             bail!("peer did not begin with a hello message");
         };
+        if let Some(version) = desired_version.as_deref()
+            && update::newer_version(CURRENT_VERSION, version)
+        {
+            let _ = self.update_hints.send(version.to_owned());
+        }
         let connection_id = Uuid::new_v4();
         let (sender, mut receiver) = watch::channel(None);
+        let mut desired_updates = self.desired_version.subscribe();
         self.peers.write().await.insert(
             connection_id,
             PeerLink {
+                node_id,
                 name: node_name.clone(),
+                version: app_version.clone(),
+                desired_version: desired_version.clone(),
                 send: sender,
             },
         );
-        info!(peer = %node_name, %node_id, %label, "peer connected");
+        info!(peer = %node_name, %node_id, version = ?app_version, %label, "peer connected");
 
         let result = loop {
             tokio::select! {
@@ -144,6 +200,14 @@ impl Daemon {
                         Ok(Message::Clip(clip)) => self.receive_clip(Arc::new(clip), &node_name, connection_id).await,
                         Ok(Message::Hello { .. }) => {
                             break Err(anyhow::anyhow!("peer sent a second hello"));
+                        }
+                        Ok(Message::UpdateAvailable { version, .. }) => {
+                            if let Some(peer) = self.peers.write().await.get_mut(&connection_id) {
+                                peer.desired_version = Some(version.clone());
+                            }
+                            if update::newer_version(CURRENT_VERSION, &version) {
+                                let _ = self.update_hints.send(version);
+                            }
                         }
                         Err(error) => break Err(error.into()),
                     }
@@ -158,6 +222,22 @@ impl Daemon {
                             break Err(error.into());
                         }
                         self.emit(Direction::Send, Some(node_name.clone()), &clip);
+                    }
+                }
+                changed = desired_updates.changed(), if app_version.is_some() => {
+                    if changed.is_err() {
+                        break Ok(());
+                    }
+                    let version = desired_updates.borrow_and_update().clone();
+                    if let Err(error) = write_message(
+                        writer,
+                        &Message::UpdateAvailable {
+                            update_id: Uuid::new_v4(),
+                            version,
+                        },
+                        self.config.max_bytes,
+                    ).await {
+                        break Err(error.into());
                     }
                 }
                 changed = shutdown.changed() => {
@@ -228,21 +308,30 @@ impl Daemon {
     }
 
     async fn status(&self) -> Status {
-        let mut connected_peers = self
-            .peers
-            .read()
-            .await
-            .values()
-            .map(|peer| peer.name.clone())
-            .collect::<Vec<_>>();
+        let peers = self.peers.read().await;
+        let mut connected_peers = peers.values().map(|peer| peer.name.clone()).collect::<Vec<_>>();
         connected_peers.sort();
         connected_peers.dedup();
+        let mut peer_statuses = peers
+            .values()
+            .map(|peer| PeerStatus {
+                node_id: peer.node_id,
+                name: peer.name.clone(),
+                version: peer.version.clone(),
+                desired_version: peer.desired_version.clone(),
+            })
+            .collect::<Vec<_>>();
+        peer_statuses.sort_by(|left, right| left.name.cmp(&right.name));
+        peer_statuses.dedup_by(|left, right| left.node_id == right.node_id);
         Status {
             running: true,
             node_id: self.config.node_id,
             node_name: self.config.node_name.clone(),
             clipboard_backend: self.clipboard.name().to_owned(),
+            version: CURRENT_VERSION.to_owned(),
+            desired_version: self.desired_version.borrow().clone(),
             connected_peers,
+            peers: peer_statuses,
         }
     }
 }
@@ -263,14 +352,35 @@ async fn next_clipboard_change(
 pub async fn run(config: Config) -> Result<()> {
     let clipboard = Arc::new(NativeClipboard::new(config.max_bytes)?);
     let paths = paths()?;
-    run_until(config, clipboard, paths.socket, shutdown_signal()).await
+    let (desired_version, _) = watch::channel(update::initial_desired_version());
+    let (update_hints, hint_receiver) = mpsc::unbounded_channel();
+    let update_desired = desired_version.clone();
+    let shutdown = async move {
+        tokio::select! {
+            () = shutdown_signal() => {}
+            version = update::run_auto_updates(update_desired, hint_receiver) => {
+                info!(%version, "automatic update installed; restarting daemon");
+            }
+        }
+    };
+    run_daemon(
+        config,
+        clipboard,
+        paths.socket,
+        shutdown,
+        desired_version,
+        update_hints,
+    )
+    .await
 }
 
-async fn run_until<F>(
+async fn run_daemon<F>(
     config: Config,
     clipboard: Arc<dyn ClipboardBackend>,
     socket: PathBuf,
     shutdown: F,
+    desired_version: watch::Sender<String>,
+    update_hints: mpsc::UnboundedSender<String>,
 ) -> Result<()>
 where
     F: Future<Output = ()>,
@@ -281,7 +391,8 @@ where
     remove_stale_socket(&socket)?;
     let listener = UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
     set_socket_permissions(&socket)?;
-    let daemon = Daemon::new(config, clipboard);
+    update::mark_healthy().await?;
+    let daemon = Daemon::with_updates(config, clipboard, desired_version, update_hints);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
     tasks.spawn(Arc::clone(&daemon).watch_clipboard(shutdown_rx.clone()));
@@ -334,18 +445,19 @@ async fn handle_local(
     let mut buffered = BufReader::new(stream);
     let mut command = String::new();
     buffered.read_line(&mut command).await?;
-    let stream = buffered.into_inner();
     match command.trim() {
         "BRIDGE" => {
-            let (mut reader, mut writer) = stream.into_split();
+            // Keep the buffered reader: the bridge command and the peer's hello can
+            // arrive in one socket read, and `into_inner` would discard those bytes.
+            let (mut reader, mut writer) = tokio::io::split(buffered);
             daemon
                 .serve_peer(&mut reader, &mut writer, "incoming SSH", shutdown)
                 .await
         }
-        "MONITOR" => serve_monitor(daemon, stream, shutdown).await,
+        "MONITOR" => serve_monitor(daemon, buffered.into_inner(), shutdown).await,
         "STATUS" => {
             let encoded = serde_json::to_vec(&daemon.status().await)?;
-            let mut stream = stream;
+            let mut stream = buffered.into_inner();
             stream.write_all(&encoded).await?;
             stream.write_all(b"\n").await?;
             Ok(())
@@ -491,6 +603,127 @@ mod tests {
     use crate::clipboard::test_support::MockClipboard;
     use crate::model::Representation;
 
+    #[test]
+    fn status_from_an_older_daemon_defaults_version_fields() {
+        let status: Status = serde_json::from_value(serde_json::json!({
+            "running": true,
+            "node_id": Uuid::new_v4(),
+            "node_name": "older-mac",
+            "clipboard_backend": "NSPasteboard",
+            "connected_peers": []
+        }))
+        .unwrap();
+
+        assert_eq!(status.version, "legacy");
+        assert_eq!(status.desired_version, "legacy");
+        assert!(status.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bridge_command_preserves_a_coalesced_peer_hello() {
+        let config = Config::default();
+        let max_bytes = config.max_bytes;
+        let clipboard = Arc::new(MockClipboard::default());
+        let daemon = Daemon::new(config, clipboard);
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(b"BRIDGE\n").await.unwrap();
+        write_message(
+            &mut client,
+            &Message::Hello {
+                node_id: Uuid::new_v4(),
+                node_name: "remote-mac".into(),
+                app_version: Some(CURRENT_VERSION.into()),
+                desired_version: Some(CURRENT_VERSION.into()),
+            },
+            max_bytes,
+        )
+        .await
+        .unwrap();
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(handle_local(Arc::clone(&daemon), server, shutdown_rx));
+        assert!(matches!(
+            read_message(&mut client, max_bytes).await.unwrap(),
+            Message::Hello { .. }
+        ));
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if daemon.status().await.connected_peers == ["remote-mac"] {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_versions_are_announced_and_peer_hints_are_forwarded() {
+        let config = Config::default();
+        let max_bytes = config.max_bytes;
+        let clipboard = Arc::new(MockClipboard::default());
+        let (desired_tx, _) = watch::channel(CURRENT_VERSION.to_owned());
+        let (hint_tx, mut hint_rx) = mpsc::unbounded_channel();
+        let daemon = Daemon::with_updates(config, clipboard, desired_tx.clone(), hint_tx);
+        let (mut peer, server) = duplex(4096);
+        let (mut reader, mut writer) = split(server);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            daemon
+                .serve_peer(&mut reader, &mut writer, "test", shutdown_rx)
+                .await
+        });
+        assert!(matches!(
+            read_message(&mut peer, max_bytes).await.unwrap(),
+            Message::Hello { .. }
+        ));
+        write_message(
+            &mut peer,
+            &Message::Hello {
+                node_id: Uuid::new_v4(),
+                node_name: "peer".into(),
+                app_version: Some(CURRENT_VERSION.into()),
+                desired_version: Some(CURRENT_VERSION.into()),
+            },
+            max_bytes,
+        )
+        .await
+        .unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            while desired_tx.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        desired_tx.send("9.0.0".into()).unwrap();
+        assert!(matches!(
+            read_message(&mut peer, max_bytes).await.unwrap(),
+            Message::UpdateAvailable { version, .. } if version == "9.0.0"
+        ));
+        write_message(
+            &mut peer,
+            &Message::UpdateAvailable {
+                update_id: Uuid::new_v4(),
+                version: "9.1.0".into(),
+            },
+            max_bytes,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), hint_rx.recv()).await.unwrap(),
+            Some("9.1.0".into())
+        );
+
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn relays_a_clip_between_peers_and_applies_it_locally() {
         let config = Config::default();
@@ -529,6 +762,8 @@ mod tests {
                 &Message::Hello {
                     node_id: Uuid::new_v4(),
                     node_name: name.into(),
+                    app_version: Some(CURRENT_VERSION.into()),
+                    desired_version: Some(CURRENT_VERSION.into()),
                 },
                 config.max_bytes,
             )
