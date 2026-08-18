@@ -25,10 +25,11 @@ function quote(value) {
 }
 
 function run(command, { inherit = false } = {}) {
-  return execSync(command, {
+  const output = execSync(command, {
     encoding: "utf8",
     stdio: inherit ? "inherit" : "pipe",
-  }).trim();
+  });
+  return typeof output === "string" ? output.trim() : "";
 }
 
 function mutate(command, options = {}) {
