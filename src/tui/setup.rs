@@ -220,13 +220,8 @@ impl SetupApp {
 
     fn render(&self, frame: &mut Frame) {
         let area = frame.area();
-        let [header, steps, body, footer] = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Length(2),
-            Constraint::Min(13),
-            Constraint::Length(2),
-        ])
-        .areas(area);
+        let [header, steps, body] =
+            Layout::vertical([Constraint::Length(3), Constraint::Length(2), Constraint::Min(1)]).areas(area);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("ssh", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
@@ -237,12 +232,27 @@ impl SetupApp {
             header,
         );
         frame.render_widget(self.steps(), steps);
+        let panel_height = self.preferred_panel_height().min(body.height.saturating_sub(2));
+        let [panel_row, help_row, _] = Layout::vertical([
+            Constraint::Length(panel_height),
+            Constraint::Length(2),
+            Constraint::Min(0),
+        ])
+        .areas(body);
         let body_width = area.width.saturating_sub(6).min(92);
         let [body_area] = Layout::horizontal([Constraint::Length(body_width)])
             .flex(Flex::Center)
-            .areas(body);
+            .areas(panel_row);
         self.render_body(frame, body_area);
-        frame.render_widget(Paragraph::new(self.help()).alignment(Alignment::Center), footer);
+        frame.render_widget(Paragraph::new(self.help()).alignment(Alignment::Center), help_row);
+    }
+
+    fn preferred_panel_height(&self) -> u16 {
+        match self.stage {
+            Stage::Entry => 11 + u16::from(self.error.is_some()) * 2 + u16::from(!self.peers.is_empty()) * 2,
+            Stage::Welcome | Stage::Verifying | Stage::Confirmed | Stage::Failed => 12,
+            Stage::Installing | Stage::Ready => 14,
+        }
     }
 
     fn steps(&self) -> Paragraph<'static> {
@@ -596,5 +606,44 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("command  ssh macbookserver"));
         assert!(!rendered.contains("ssh  macbookserver"));
+    }
+
+    #[test]
+    fn confirmed_actions_stay_next_to_the_verified_peer() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut app = SetupApp::new(runtime.handle().clone(), Config::default());
+        app.stage = Stage::Confirmed;
+        app.peers.push(VerifiedPeer {
+            command: "ssh macbookserver".into(),
+            probe: ProbeResult {
+                os: "darwin".into(),
+                arch: "arm64".into(),
+                home: "/Users/me".into(),
+                hostname: "MacBookPro.home.local".into(),
+            },
+        });
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .map(|cells| {
+                cells
+                    .iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let verified_row = rows
+            .iter()
+            .position(|row| row.contains("ready for installation"))
+            .unwrap();
+        let actions_row = rows.iter().position(|row| row.contains("enter install")).unwrap();
+        assert!(actions_row > verified_row);
+        assert!(actions_row - verified_row <= 5);
+        assert!(actions_row < rows.len() / 2);
     }
 }
