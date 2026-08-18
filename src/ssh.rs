@@ -13,6 +13,7 @@ const SSH_OPTIONS: &[&str] = &[
     "-oBatchMode=yes",
     "-oPasswordAuthentication=no",
     "-oKbdInteractiveAuthentication=no",
+    "-oStrictHostKeyChecking=accept-new",
     "-oConnectTimeout=10",
     "-oServerAliveInterval=15",
     "-oServerAliveCountMax=3",
@@ -238,6 +239,11 @@ fn normalize_arch(arch: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_connections_accept_only_new_host_keys() {
+        assert!(SSH_OPTIONS.contains(&"-oStrictHostKeyChecking=accept-new"));
+    }
 
     #[test]
     fn accepts_options_and_quoted_paths() {
