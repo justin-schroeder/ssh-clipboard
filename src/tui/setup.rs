@@ -126,11 +126,15 @@ impl SetupApp {
                 KeyCode::Enter | KeyCode::Char('i') => self.begin_install(),
                 _ => {}
             },
-            Stage::Ready => {
-                if matches!(key.code, KeyCode::Enter | KeyCode::Char('q')) {
-                    self.quit = true;
+            Stage::Ready => match key.code {
+                KeyCode::Char('a') => {
+                    self.input.clear();
+                    self.error = None;
+                    self.stage = Stage::Entry;
                 }
-            }
+                KeyCode::Enter | KeyCode::Char('q') => self.quit = true,
+                _ => {}
+            },
             Stage::Failed if key.code == KeyCode::Char('r') => self.begin_install(),
             Stage::Verifying | Stage::Installing | Stage::Failed => {}
         }
@@ -482,7 +486,11 @@ impl SetupApp {
             Stage::Entry => &[("enter", "verify / install"), ("ctrl+c", "quit")],
             Stage::Confirmed => &[("enter", "install"), ("a", "add another"), ("ctrl+c", "quit")],
             Stage::Installing | Stage::Verifying => &[("ctrl+c", "cancel")],
-            Stage::Ready => &[("enter", "close"), ("ssh-clipboard monitor", "watch activity")],
+            Stage::Ready => &[
+                ("a", "add another"),
+                ("enter", "close"),
+                ("ssh-clipboard monitor", "watch activity"),
+            ],
             Stage::Failed => &[("r", "retry"), ("ctrl+c", "quit")],
         };
         let mut spans = Vec::new();
@@ -645,5 +653,32 @@ mod tests {
         assert!(actions_row > verified_row);
         assert!(actions_row - verified_row <= 5);
         assert!(actions_row < rows.len() / 2);
+    }
+
+    #[test]
+    fn ready_screen_can_add_another_peer_without_forgetting_existing_peers() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut app = SetupApp::new(runtime.handle().clone(), Config::default());
+        app.stage = Stage::Ready;
+        app.input = "stale input".into();
+        app.error = Some("stale error".into());
+        app.peers.push(VerifiedPeer {
+            command: "ssh macbookserver".into(),
+            probe: ProbeResult {
+                os: "darwin".into(),
+                arch: "arm64".into(),
+                home: "/Users/me".into(),
+                hostname: "MacBookPro.home.local".into(),
+            },
+        });
+
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+
+        assert_eq!(app.stage, Stage::Entry);
+        assert!(app.input.is_empty());
+        assert!(app.error.is_none());
+        assert_eq!(app.peers.len(), 1);
+        assert_eq!(app.peers[0].command, "ssh macbookserver");
+        assert!(app.help().to_string().contains("enter verify / install"));
     }
 }
