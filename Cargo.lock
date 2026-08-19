@@ -2421,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "ssh-clipboard"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "async-trait",
