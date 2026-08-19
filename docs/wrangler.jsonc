@@ -1,0 +1,16 @@
+// Cloudflare Workers static-assets config for the ssh-clipboard site.
+// Connected to the GitHub repo via Workers Builds (dashboard), so every push
+// to main builds and deploys on Cloudflare — no GitHub Actions involved.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ssh-clipboard-site",
+  "main": "worker/index.js",
+  "compatibility_date": "2026-08-01",
+  "account_id": "fd9e24c9339e83e73661475690574340",
+  "routes": [{ "pattern": "ssh-clipboard.standardagents.ai", "custom_domain": true }],
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  }
+}
