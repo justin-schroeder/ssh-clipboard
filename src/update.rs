@@ -24,7 +24,7 @@ use crate::deploy;
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const NPM_LATEST_URL: &str = "https://registry.npmjs.org/ssh-clipboard/latest";
 const NPM_TARBALL_PREFIX: &str = "https://registry.npmjs.org/ssh-clipboard/-/";
-const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
@@ -414,6 +414,11 @@ mod tests {
         assert!(newer_version("0.2.9", "0.3.0"));
         assert!(!newer_version("1.0.0", "0.99.99"));
         assert!(!newer_version("1.0.0", "1.1.0-dev.abcdef0"));
+    }
+
+    #[test]
+    fn automatic_updates_are_checked_every_fifteen_minutes() {
+        assert_eq!(CHECK_INTERVAL, Duration::from_secs(15 * 60));
     }
 
     #[test]

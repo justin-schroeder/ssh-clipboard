@@ -283,8 +283,7 @@ impl MonitorApp {
             let peer_status = live_status.or_else(|| self.peer_statuses.get(&peer));
             let peer_version = peer_status.and_then(|status| status.version.as_deref());
             let peer_desired = peer_status.and_then(|status| status.desired_version.as_deref());
-            let target_version =
-                peer_desired.or_else(|| peer_version.and_then(known_version).and(desired_version));
+            let target_version = peer_target_version(peer_version, peer_desired, desired_version);
             let peer_label = peer_status
                 .and_then(|status| status.machine_name.as_deref())
                 .filter(|name| !name.is_empty())
@@ -374,6 +373,11 @@ impl MonitorApp {
                 }
             }
         }
+        for peer in self.peer_statuses.keys() {
+            if !peers.contains(peer) {
+                peers.push(peer.clone());
+            }
+        }
         peers.sort();
         peers.dedup();
         peers
@@ -458,6 +462,22 @@ fn version_label(version: Option<&str>) -> String {
 
 fn known_version(version: &str) -> Option<&str> {
     (!version.is_empty() && version != "legacy").then_some(version)
+}
+
+fn peer_target_version<'a>(
+    installed: Option<&str>,
+    peer_desired: Option<&'a str>,
+    local_desired: Option<&'a str>,
+) -> Option<&'a str> {
+    installed.and_then(known_version)?;
+    match (
+        peer_desired.and_then(known_version),
+        local_desired.and_then(known_version),
+    ) {
+        (Some(peer), Some(local)) if update::newer_version(peer, local) => Some(local),
+        (Some(peer), _) => Some(peer),
+        (None, local) => local,
+    }
 }
 
 fn peer_update_state(
@@ -872,5 +892,78 @@ mod tests {
         let notice = app.update_notice.as_deref().unwrap();
         assert!(notice.contains("Announced v1.2.3 to 2 peers"));
         assert!(notice.contains("1 connected peer cannot receive update events"));
+    }
+
+    #[test]
+    fn monitor_refreshes_versions_across_daemon_and_peer_restarts() {
+        let (_sender, receiver) = mpsc::channel();
+        let config = Config {
+            node_name: "local".into(),
+            ..Config::default()
+        };
+        let peer_id = Uuid::new_v4();
+        let mut app = monitor_app(config.clone(), receiver);
+        app.on_message(UiMessage::Status(Status {
+            running: true,
+            node_id: config.node_id,
+            node_name: config.node_name.clone(),
+            machine_name: "local-machine.local".into(),
+            clipboard_backend: "NSPasteboard".into(),
+            version: "1.0.0".into(),
+            desired_version: "1.1.0".into(),
+            configured_peers: Vec::new(),
+            connected_peers: vec!["peer".into()],
+            peers: vec![PeerStatus {
+                node_id: peer_id,
+                name: "peer".into(),
+                machine_name: Some("peer-machine.local".into()),
+                version: Some("1.0.0".into()),
+                desired_version: Some("1.0.0".into()),
+            }],
+        }));
+
+        assert_eq!(
+            peer_target_version(Some("1.0.0"), Some("1.0.0"), Some("1.1.0")),
+            Some("1.1.0")
+        );
+        app.on_message(UiMessage::Offline("daemon restarting".into()));
+        assert_eq!(app.peer_names(), vec!["peer"]);
+
+        app.on_message(UiMessage::Status(Status {
+            running: true,
+            node_id: config.node_id,
+            node_name: config.node_name,
+            machine_name: "local-machine.local".into(),
+            clipboard_backend: "NSPasteboard".into(),
+            version: "1.1.0".into(),
+            desired_version: "1.1.0".into(),
+            configured_peers: Vec::new(),
+            connected_peers: vec!["peer".into()],
+            peers: vec![PeerStatus {
+                node_id: peer_id,
+                name: "peer".into(),
+                machine_name: Some("peer-machine.local".into()),
+                version: Some("1.1.0".into()),
+                desired_version: Some("1.1.0".into()),
+            }],
+        }));
+
+        let peer = app.peer_statuses.get("peer").unwrap();
+        assert_eq!(app.status.as_ref().unwrap().version, "1.1.0");
+        assert_eq!(peer.version.as_deref(), Some("1.1.0"));
+
+        let backend = TestBackend::new(150, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("peer-machine.local"));
+        assert!(rendered.contains("v1.1.0"));
+        assert!(!rendered.contains("v1.0.0"));
     }
 }
