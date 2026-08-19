@@ -12,6 +12,9 @@ use clipboard_rs::{ClipboardHandler, ClipboardWatcher, ClipboardWatcherContext};
 use crate::model::Representation;
 use crate::{filebundle, filebundle::BUNDLE_FORMAT};
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub representations: Vec<Representation>,
@@ -75,6 +78,9 @@ impl NativeClipboard {
 
     fn capture_sync(&self) -> Result<Option<Snapshot>> {
         use clipboard_rs::Clipboard;
+        #[cfg(target_os = "macos")]
+        use clipboard_rs::common::RustImage;
+
         let context = self
             .context
             .lock()
@@ -140,12 +146,39 @@ impl NativeClipboard {
                 });
             }
         }
+        #[cfg(target_os = "macos")]
+        if !representations
+            .iter()
+            .any(|representation| is_image_format(&representation.format))
+            && let Ok(image) = context.get_image()
+            && let Ok(png) = image.to_png()
+        {
+            let data = png.get_bytes().to_vec();
+            let size = u64::try_from(data.len()).unwrap_or(u64::MAX);
+            if total.saturating_add(size) <= self.max_bytes {
+                total += size;
+                representations.push(Representation {
+                    item: 0,
+                    format: "public.png".into(),
+                    data,
+                });
+            }
+        }
         add_portable_aliases(&mut representations, self.max_bytes.saturating_sub(total));
         total = representations
             .iter()
             .map(|representation| u64::try_from(representation.data.len()).unwrap_or(u64::MAX))
             .sum();
-        filebundle::attach_bundle(&mut representations, self.max_bytes.saturating_sub(total))?;
+        if let Err(error) =
+            filebundle::attach_bundle(&mut representations, self.max_bytes.saturating_sub(total))
+        {
+            let has_rendered_image = representations
+                .iter()
+                .any(|representation| is_image_format(&representation.format));
+            if !has_rendered_image || !is_permission_denied(&error) {
+                return Err(error);
+            }
+        }
         if representations.is_empty() {
             Ok(None)
         } else {
@@ -170,6 +203,18 @@ impl NativeClipboard {
         }
         let mut contents = Vec::with_capacity(representations.len());
         let native_files = clipboard_file_paths(representations);
+        #[cfg(target_os = "macos")]
+        if native_files.len() == 1 && std::path::Path::new(&native_files[0]).is_file() {
+            let context = self
+                .context
+                .lock()
+                .map_err(|_| anyhow::anyhow!("clipboard lock poisoned"))?;
+            macos::publish_single_file(std::path::Path::new(&native_files[0]), representations)?;
+            drop(context);
+            return self
+                .capture_sync()?
+                .context("native clipboard was empty immediately after publishing");
+        }
         if cfg!(target_os = "macos") && !native_files.is_empty() {
             // Finder requires the pasteboard selection to consist entirely of
             // NSURL file objects. clipboard-rs writes Files separately, so
@@ -303,6 +348,35 @@ fn is_file_format(format: &str) -> bool {
     )
 }
 
+fn is_image_format(format: &str) -> bool {
+    matches!(
+        format,
+        "public.png"
+            | "image/png"
+            | "public.jpeg"
+            | "image/jpeg"
+            | "image/jpg"
+            | "public.tiff"
+            | "image/tiff"
+            | "com.compuserve.gif"
+            | "image/gif"
+            | "public.heic"
+            | "image/heic"
+            | "public.heif"
+            | "image/heif"
+            | "org.webmproject.webp"
+            | "image/webp"
+    )
+}
+
+fn is_permission_denied(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+    })
+}
+
 fn clipboard_file_paths(representations: &[Representation]) -> Vec<String> {
     let mut seen = HashSet::new();
     representations
@@ -324,8 +398,12 @@ fn add_portable_aliases(representations: &mut Vec<Representation>, mut remaining
             "public.html" => "text/html",
             "public.rtf" => "text/rtf",
             "public.png" => "image/png",
+            "public.jpeg" => "image/jpeg",
             "public.tiff" => "image/tiff",
+            "com.compuserve.gif" => "image/gif",
             "public.heic" => "image/heic",
+            "public.heif" => "image/heif",
+            "org.webmproject.webp" => "image/webp",
             "com.adobe.pdf" => "application/pdf",
             "public.file-url" => "text/uri-list",
             _ => continue,
@@ -437,6 +515,16 @@ mod tests {
     fn password_manager_markers_block_the_entire_clipboard() {
         assert!(is_sensitive_marker("org.nspasteboard.ConcealedType"));
         assert!(is_sensitive_marker("x-kde-passwordManagerHint"));
+    }
+
+    #[test]
+    fn only_permission_errors_are_safe_to_replace_with_a_rendered_image() {
+        let permission = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            .context("read copied file");
+        let too_large = anyhow::anyhow!("copied-file bundle exceeds the clipboard limit");
+
+        assert!(is_permission_denied(&permission));
+        assert!(!is_permission_denied(&too_large));
     }
 
     #[test]

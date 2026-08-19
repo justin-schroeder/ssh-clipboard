@@ -16,11 +16,11 @@ Each daemon owns a mode-`0600` Unix socket. `ssh-clipboard bridge` contains no c
 
 1. A platform backend enumerates every offered format and reads its raw bytes.
 2. Sensitive clipboard markers exclude the entire value.
-3. Common macOS types gain additive portable aliases.
-4. File URL lists gain a private file bundle containing regular files/directories.
+3. Common macOS types gain additive portable aliases. File-backed images are also rendered through AppKit while pasteboard access is available, so protected Messages attachments do not depend solely on filesystem traversal.
+4. Readable file URL lists gain a private file bundle containing regular files/directories. If macOS denies direct access to an image attachment, its rendered image representation remains transferable.
 5. A SHA-256 fingerprint detects unchanged clipboard snapshots.
 6. The event receives a UUID and is sent over every peer’s newest-value channel.
-7. The receiver deduplicates the UUID, relays it to other peers, materializes file bundles, and atomically publishes all safe representations. On macOS, a received file selection is published as native `NSURL` pasteboard objects without a competing generic item, so Finder can paste it into any folder.
+7. The receiver deduplicates the UUID, relays it to other peers, materializes file bundles, and atomically publishes all safe representations. On macOS, a single image file is published as one pasteboard item containing both its native file URL and image data, making the same value pasteable in Finder and image-aware terminal or chat inputs. Multi-file selections remain native `NSURL` objects for Finder.
 8. The hash of the clipboard actually published by the OS suppresses the watcher echo.
 
 The protocol has an eight-byte prefix (`SCB1` plus a big-endian header length), a bounded JSON header, and raw representation bodies. Both header and aggregate body sizes are bounded before allocation.
