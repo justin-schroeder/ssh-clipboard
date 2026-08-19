@@ -1,14 +1,14 @@
 {
   "name": "ssh-clipboard",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Native, encrypted clipboard sync over SSH for macOS and Linux",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/justin-schroeder/ssh-clipboard.git"
+    "url": "git+https://github.com/standardagents/ssh-clipboard.git"
   },
-  "homepage": "https://github.com/justin-schroeder/ssh-clipboard#readme",
-  "bugs": "https://github.com/justin-schroeder/ssh-clipboard/issues",
+  "homepage": "https://github.com/standardagents/ssh-clipboard#readme",
+  "bugs": "https://github.com/standardagents/ssh-clipboard/issues",
   "type": "module",
   "bin": {
     "ssh-clipboard": "bin/ssh-clipboard.js"

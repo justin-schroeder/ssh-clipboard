@@ -4,7 +4,7 @@
 
 ### Your clipboard. Every machine. No cloud.
 
-[![CI](https://github.com/justin-schroeder/ssh-clipboard/actions/workflows/ci.yml/badge.svg)](https://github.com/justin-schroeder/ssh-clipboard/actions/workflows/ci.yml)
+[![CI](https://github.com/standardagents/ssh-clipboard/actions/workflows/ci.yml/badge.svg)](https://github.com/standardagents/ssh-clipboard/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/ssh-clipboard?color=cb3837&logo=npm)](https://www.npmjs.com/package/ssh-clipboard)
 [![MIT](https://img.shields.io/badge/license-MIT-7c3aed)](LICENSE)
 

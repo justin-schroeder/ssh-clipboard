@@ -45,7 +45,7 @@ npm run release -- --dry-run   # run every gate without changing Git or versions
 
 Stable releases update the Rust manifest/lockfile and npm manifest/lockfile together, commit the version to `main`, create `vX.Y.Z`, and push the branch and tag. Prereleases use a temporary local branch, push only `vX.Y.Z-<dist-tag>.<commit-hash>`, and leave `main` on its stable version. The workflow derives the npm dist-tag from the Git tag, verifies all four source versions, builds all four native targets, validates their executable headers and checksums, and publishes idempotently through npm OIDC.
 
-The repository metadata in `package.json` must exactly match the public GitHub repository for npm provenance. It is set to `justin-schroeder/ssh-clipboard`. The version in `package.json` and `Cargo.toml` must match the release tag.
+The repository metadata in `package.json` must exactly match the public GitHub repository for npm provenance. It is set to `standardagents/ssh-clipboard`. The version in `package.json` and `Cargo.toml` must match the release tag.
 
 ## macOS signing
 
