@@ -18,7 +18,7 @@ The welcome panel establishes three promises: no cloud account, no format conver
 
 Installation is a short checklist with peer name, current action, a progress bar, and a quiet performance note. Failures stay in context and offer an idempotent retry. The ready state explains that normal copy/paste and clipboard history now work; it does not invent a new interaction model.
 
-The monitor includes the running or desired release version beside the clipboard backend. Connected peers discovered through incoming bridges appear even when they are not present in this node's outbound configuration.
+The monitor lists one machine per row with separate connection, installed-version, target-version, and update-state columns. It retains the last reported version while a peer reconnects and describes peers that predate version reporting as `version unknown · setup required` rather than calling them legacy. Connected peers discovered through incoming bridges appear even when they are not present in this node's outbound configuration.
 
 ## Monitor
 
@@ -30,7 +30,7 @@ TIME          FLOW                 CONTENT                 SIZE       FORMATS
 14:03:13.910  ◆ copied here        hello from the Mac      18 B       2
 ```
 
-Clipboard previews must remove terminal control characters and be Unicode-safe. Images/binary values fall back to a format description. `p` pauses visual ingestion, `c` clears session rows/totals, and `q` exits; the daemon is never stopped from the monitor.
+Clipboard previews must remove terminal control characters and be Unicode-safe. Images/binary values fall back to a format description. `p` pauses visual ingestion, `c` clears session rows/totals, `u` queues an npm release check and re-announces the desired version to update-capable connected peers, and `q` exits; the daemon is never stopped from the monitor.
 
 ## Non-negotiables
 

@@ -14,7 +14,7 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::config::Config;
-use crate::daemon::{self, Status};
+use crate::daemon::{self, PeerStatus, Status, UpdateNotification};
 use crate::model::{Direction, MonitorEvent, human_bytes};
 use crate::update;
 
@@ -25,15 +25,24 @@ enum UiMessage {
     Status(Status),
     Offline(String),
     Error(String),
+    UpdateNotified(UpdateNotification),
+    UpdateFailed(String),
+}
+
+enum MonitorCommand {
+    NotifyUpdates,
 }
 
 struct MonitorApp {
     config: Config,
     receiver: Receiver<UiMessage>,
+    commands: tokio::sync::mpsc::UnboundedSender<MonitorCommand>,
     status: Option<Status>,
-    machine_names: HashMap<String, String>,
+    peer_statuses: HashMap<String, PeerStatus>,
     events: VecDeque<MonitorEvent>,
     error: Option<String>,
+    update_notice: Option<String>,
+    update_pending: bool,
     paused: bool,
     sent: u64,
     received: u64,
@@ -41,14 +50,21 @@ struct MonitorApp {
 }
 
 impl MonitorApp {
-    fn new(config: Config, receiver: Receiver<UiMessage>) -> Self {
+    fn new(
+        config: Config,
+        receiver: Receiver<UiMessage>,
+        commands: tokio::sync::mpsc::UnboundedSender<MonitorCommand>,
+    ) -> Self {
         Self {
             config,
             receiver,
+            commands,
             status: None,
-            machine_names: HashMap::new(),
+            peer_statuses: HashMap::new(),
             events: VecDeque::new(),
             error: None,
+            update_notice: None,
+            update_pending: false,
             paused: false,
             sent: 0,
             received: 0,
@@ -73,6 +89,15 @@ impl MonitorApp {
                         self.events.clear();
                         self.sent = 0;
                         self.received = 0;
+                    }
+                    KeyCode::Char('u') if !self.update_pending => {
+                        self.update_pending = true;
+                        self.update_notice =
+                            Some("Checking npm latest and notifying connected peers…".into());
+                        if self.commands.send(MonitorCommand::NotifyUpdates).is_err() {
+                            self.update_pending = false;
+                            self.update_notice = Some("Could not contact the update worker.".into());
+                        }
                     }
                     _ => {}
                 }
@@ -99,9 +124,7 @@ impl MonitorApp {
             }
             UiMessage::Status(status) => {
                 for peer in &status.peers {
-                    if let Some(machine_name) = peer.machine_name.as_ref().filter(|name| !name.is_empty()) {
-                        self.machine_names.insert(peer.name.clone(), machine_name.clone());
-                    }
+                    self.peer_statuses.insert(peer.name.clone(), peer.clone());
                 }
                 self.status = Some(status);
                 self.error = None;
@@ -111,14 +134,45 @@ impl MonitorApp {
                 self.error = Some(error);
             }
             UiMessage::Error(error) => self.error = Some(error),
+            UiMessage::UpdateNotified(notification) => {
+                self.update_pending = false;
+                let unknown = if notification.version_unknown_peers == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        "; {} connected peer{} cannot receive update events",
+                        notification.version_unknown_peers,
+                        if notification.version_unknown_peers == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    )
+                };
+                self.update_notice = Some(format!(
+                    "Announced v{} to {} peer{}{}; npm check queued.",
+                    notification.version,
+                    notification.notified_peers,
+                    if notification.notified_peers == 1 { "" } else { "s" },
+                    unknown
+                ));
+            }
+            UiMessage::UpdateFailed(error) => {
+                self.update_pending = false;
+                self.update_notice = Some(format!("Update notification failed: {error}"));
+            }
         }
     }
 
     fn render(&self, frame: &mut Frame) {
         let area = frame.area();
+        let peer_height = u16::try_from(self.peer_names().len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(7)
+            .clamp(8, area.height.saturating_sub(14).max(8));
         let [header, peers, activity, footer] = Layout::vertical([
             Constraint::Length(4),
-            Constraint::Length(7),
+            Constraint::Length(peer_height),
             Constraint::Min(8),
             Constraint::Length(2),
         ])
@@ -139,6 +193,8 @@ impl MonitorApp {
                 muted(" pause   •   "),
                 key("c"),
                 muted(" clear   •   "),
+                key("u"),
+                muted(" notify updates   •   "),
                 key("q"),
                 muted(" close"),
             ]))
@@ -180,23 +236,11 @@ impl MonitorApp {
             .as_ref()
             .map(|status| status.connected_peers.iter().cloned().collect::<HashSet<_>>())
             .unwrap_or_default();
-        let mut peer_names = self.status.as_ref().map_or_else(
-            || {
-                self.config
-                    .peers
-                    .iter()
-                    .map(|peer| peer.name.clone())
-                    .collect::<Vec<_>>()
-            },
-            |status| status.configured_peers.clone(),
-        );
-        for peer in &connected {
-            if !peer_names.contains(peer) {
-                peer_names.push(peer.clone());
-            }
-        }
-        peer_names.sort();
-        let desired_version = self.status.as_ref().map(|status| status.desired_version.as_str());
+        let peer_names = self.peer_names();
+        let desired_version = self
+            .status
+            .as_ref()
+            .and_then(|status| known_version(&status.desired_version));
         let local_name = self.status.as_ref().map_or_else(
             || self.config.node_name.as_str(),
             |status| {
@@ -207,60 +251,56 @@ impl MonitorApp {
                 }
             },
         );
-        let mut spans = vec![
-            Span::styled("● ", Style::new().fg(GREEN)),
-            Span::styled(local_name.to_owned(), Style::new().fg(SOFT).bold()),
-            Span::styled("  this machine", Style::new().fg(MUTED)),
-        ];
+        let local_version = self
+            .status
+            .as_ref()
+            .and_then(|status| known_version(&status.version));
+        let local_state = match (local_version, desired_version) {
+            (Some(installed), Some(desired)) if installed == desired => "current",
+            (Some(_), Some(_)) => "updating",
+            _ => "detecting",
+        };
+        let mut rows = vec![Row::new(vec![
+            Cell::from(Line::from(vec![
+                Span::styled("● ", Style::new().fg(GREEN)),
+                Span::styled(local_name.to_owned(), Style::new().fg(SOFT).bold()),
+            ])),
+            Cell::from("this machine").style(Style::new().fg(MUTED)),
+            Cell::from(version_label(local_version)).style(Style::new().fg(SOFT)),
+            Cell::from(version_label(desired_version)).style(Style::new().fg(SOFT)),
+            Cell::from(local_state).style(Style::new().fg(if local_state == "current" {
+                GREEN
+            } else {
+                YELLOW
+            })),
+        ])];
         for peer in peer_names {
-            spans.push(Span::styled("     │     ", Style::new().fg(PANEL)));
             let is_connected = connected.contains(&peer);
-            let peer_status = self
+            let live_status = self
                 .status
                 .as_ref()
                 .and_then(|status| status.peers.iter().find(|status| status.name == peer));
+            let peer_status = live_status.or_else(|| self.peer_statuses.get(&peer));
             let peer_version = peer_status.and_then(|status| status.version.as_deref());
             let peer_desired = peer_status.and_then(|status| status.desired_version.as_deref());
+            let target_version =
+                peer_desired.or_else(|| peer_version.and_then(known_version).and(desired_version));
             let peer_label = peer_status
                 .and_then(|status| status.machine_name.as_deref())
                 .filter(|name| !name.is_empty())
-                .or_else(|| self.machine_names.get(&peer).map(String::as_str))
                 .unwrap_or(&peer);
-            let is_current = is_connected
-                && peer_version.is_some_and(|version| Some(version) == desired_version)
-                && peer_desired.is_none_or(|version| Some(version) == desired_version);
-            let color = if is_current {
-                GREEN
-            } else if is_connected {
-                YELLOW
-            } else {
-                RED
-            };
-            spans.push(Span::styled(
-                if is_connected { "● " } else { "○ " },
-                Style::new().fg(color),
-            ));
-            spans.push(Span::styled(peer_label.to_owned(), Style::new().fg(SOFT).bold()));
-            spans.push(Span::styled(
-                if !is_connected {
-                    "  reconnecting".to_owned()
-                } else if peer_version.is_none() {
-                    "  connected · legacy (upgrade required)".to_owned()
-                } else if peer_desired.is_some_and(|desired| {
-                    peer_version.is_some_and(|version| update::newer_version(version, desired))
-                }) {
-                    format!(
-                        "  updating · v{} → v{}",
-                        peer_version.unwrap_or("legacy"),
-                        peer_desired.unwrap_or("unknown")
-                    )
-                } else if is_current {
-                    format!("  connected · v{}", peer_version.unwrap_or("legacy"))
-                } else {
-                    format!("  outdated · {}", peer_version.unwrap_or("legacy"))
-                },
-                Style::new().fg(if is_current { MUTED } else { color }),
-            ));
+            let (state, color) = peer_update_state(is_connected, peer_version, peer_desired, desired_version);
+            rows.push(Row::new(vec![
+                Cell::from(Line::from(vec![
+                    Span::styled(if is_connected { "● " } else { "○ " }, Style::new().fg(color)),
+                    Span::styled(peer_label.to_owned(), Style::new().fg(SOFT).bold()),
+                ])),
+                Cell::from(if is_connected { "connected" } else { "reconnecting" })
+                    .style(Style::new().fg(if is_connected { MUTED } else { RED })),
+                Cell::from(version_label(peer_version)).style(Style::new().fg(SOFT)),
+                Cell::from(version_label(target_version)).style(Style::new().fg(SOFT)),
+                Cell::from(state).style(Style::new().fg(color)),
+            ]));
         }
         let backend = self
             .status
@@ -269,7 +309,9 @@ impl MonitorApp {
         let version = self.status.as_ref().map_or_else(
             || "detecting".to_owned(),
             |status| {
-                if status.version == status.desired_version {
+                if known_version(&status.version).is_none() {
+                    "unknown".into()
+                } else if status.version == status.desired_version {
                     format!("v{}", status.version)
                 } else {
                     format!("v{} → v{}", status.version, status.desired_version)
@@ -279,23 +321,62 @@ impl MonitorApp {
         let block = panel("  Peers  ");
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(spans),
-                Line::raw(""),
-                Line::from(vec![
-                    muted("backend "),
-                    Span::styled(backend.to_owned(), Style::new().fg(SOFT)),
-                    muted("     version "),
-                    Span::styled(version, Style::new().fg(SOFT)),
-                    muted("     sent "),
-                    Span::styled(human_bytes(self.sent), Style::new().fg(SOFT)),
-                    muted("     received "),
-                    Span::styled(human_bytes(self.received), Style::new().fg(SOFT)),
-                ]),
-            ]),
-            inner,
+        let [table_area, details_area] =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(inner);
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Min(22),
+                Constraint::Length(13),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Min(18),
+            ],
         );
+        let header = Row::new(["MACHINE", "CONNECTION", "INSTALLED", "TARGET", "UPDATE"])
+            .style(Style::new().fg(MUTED).add_modifier(Modifier::BOLD))
+            .bottom_margin(1);
+        frame.render_widget(table.header(header).column_spacing(1), table_area);
+        let mut details = vec![Line::from(vec![
+            muted("backend "),
+            Span::styled(backend.to_owned(), Style::new().fg(SOFT)),
+            muted("   local "),
+            Span::styled(version, Style::new().fg(SOFT)),
+            muted("   sent "),
+            Span::styled(human_bytes(self.sent), Style::new().fg(SOFT)),
+            muted("   received "),
+            Span::styled(human_bytes(self.received), Style::new().fg(SOFT)),
+        ])];
+        if let Some(notice) = &self.update_notice {
+            details.push(Line::styled(
+                clean_truncate(notice, usize::from(details_area.width)),
+                Style::new().fg(if self.update_pending { YELLOW } else { CYAN }),
+            ));
+        }
+        frame.render_widget(Paragraph::new(details), details_area);
+    }
+
+    fn peer_names(&self) -> Vec<String> {
+        let mut peers = self.status.as_ref().map_or_else(
+            || {
+                self.config
+                    .peers
+                    .iter()
+                    .map(|peer| peer.name.clone())
+                    .collect::<Vec<_>>()
+            },
+            |status| status.configured_peers.clone(),
+        );
+        if let Some(status) = &self.status {
+            for peer in &status.connected_peers {
+                if !peers.contains(peer) {
+                    peers.push(peer.clone());
+                }
+            }
+        }
+        peers.sort();
+        peers.dedup();
+        peers
     }
 
     fn render_activity(&self, frame: &mut Frame, area: Rect) {
@@ -367,6 +448,42 @@ impl MonitorApp {
         .column_spacing(1);
         frame.render_widget(table, inner);
     }
+}
+
+fn version_label(version: Option<&str>) -> String {
+    version
+        .and_then(known_version)
+        .map_or_else(|| "unknown".into(), |version| format!("v{version}"))
+}
+
+fn known_version(version: &str) -> Option<&str> {
+    (!version.is_empty() && version != "legacy").then_some(version)
+}
+
+fn peer_update_state(
+    connected: bool,
+    installed: Option<&str>,
+    peer_desired: Option<&str>,
+    local_desired: Option<&str>,
+) -> (&'static str, ratatui::style::Color) {
+    if !connected {
+        return ("offline", RED);
+    }
+    let Some(installed) = installed.and_then(known_version) else {
+        return ("version unknown · setup required", YELLOW);
+    };
+    let peer_desired = peer_desired.and_then(known_version);
+    let local_desired = local_desired.and_then(known_version);
+    if peer_desired.is_some_and(|desired| update::newer_version(installed, desired)) {
+        return ("updating", YELLOW);
+    }
+    if local_desired.is_some_and(|desired| update::newer_version(installed, desired)) {
+        return ("outdated · press u", YELLOW);
+    }
+    if local_desired.is_some_and(|desired| update::newer_version(desired, installed)) {
+        return ("ahead", CYAN);
+    }
+    ("current", GREEN)
 }
 
 fn panel(title: &'static str) -> Block<'static> {
@@ -472,14 +589,42 @@ async fn status_feed(sender: Sender<UiMessage>, mut shutdown: watch::Receiver<bo
     }
 }
 
+async fn command_feed(
+    sender: Sender<UiMessage>,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<MonitorCommand>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            command = commands.recv() => match command {
+                Some(MonitorCommand::NotifyUpdates) => {
+                    let message = match daemon::notify_updates().await {
+                        Ok(notification) => UiMessage::UpdateNotified(notification),
+                        Err(error) => UiMessage::UpdateFailed(error.to_string()),
+                    };
+                    let _ = sender.send(message);
+                }
+                None => return,
+            },
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 pub async fn run_monitor(config: Config) -> Result<()> {
     let handle = Handle::current();
     let (sender, receiver) = mpsc::channel();
+    let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     handle.spawn(monitor_feed(sender.clone(), shutdown_rx.clone()));
-    handle.spawn(status_feed(sender, shutdown_rx));
+    handle.spawn(status_feed(sender.clone(), shutdown_rx.clone()));
+    handle.spawn(command_feed(sender, command_rx, shutdown_rx));
     tokio::task::spawn_blocking(move || {
-        ratatui::run(|terminal| MonitorApp::new(config, receiver).run(terminal))
+        ratatui::run(|terminal| MonitorApp::new(config, receiver, command_tx).run(terminal))
     })
     .await
     .context("monitor TUI task failed")??;
@@ -496,6 +641,11 @@ mod tests {
     use super::*;
     use crate::model::{RepresentationInfo, now_millis};
 
+    fn monitor_app(config: Config, receiver: Receiver<UiMessage>) -> MonitorApp {
+        let (commands, _command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        MonitorApp::new(config, receiver, commands)
+    }
+
     #[test]
     fn monitor_renders_peer_health_and_native_activity() {
         let (sender, receiver) = mpsc::channel();
@@ -507,7 +657,7 @@ mod tests {
             name: "server".into(),
             ssh_command: "ssh server".into(),
         });
-        let mut app = MonitorApp::new(config.clone(), receiver);
+        let mut app = monitor_app(config.clone(), receiver);
         app.on_message(UiMessage::Status(Status {
             running: true,
             node_id: config.node_id,
@@ -552,7 +702,9 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("● LIVE"));
         assert!(rendered.contains("local-machine.local"));
-        assert!(rendered.contains("server-machine.local  connected"));
+        assert!(rendered.contains("server-machine.local"));
+        assert!(rendered.contains(&format!("v{}", crate::update::CURRENT_VERSION)));
+        assert!(rendered.contains("current"));
         assert!(rendered.contains("design.pdf"));
         assert!(rendered.contains("4.0 KiB"));
     }
@@ -564,7 +716,7 @@ mod tests {
             node_name: "local".into(),
             ..Config::default()
         };
-        let mut app = MonitorApp::new(config.clone(), receiver);
+        let mut app = monitor_app(config.clone(), receiver);
         app.on_message(UiMessage::Status(Status {
             running: true,
             node_id: config.node_id,
@@ -607,7 +759,7 @@ mod tests {
             name: "server".into(),
             ssh_command: "ssh server".into(),
         });
-        let mut app = MonitorApp::new(config.clone(), receiver);
+        let mut app = monitor_app(config.clone(), receiver);
         app.on_message(UiMessage::Status(Status {
             running: true,
             node_id: config.node_id,
@@ -639,5 +791,86 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("updating"));
         assert!(rendered.contains(&format!("v{} → v9.0.0", crate::update::CURRENT_VERSION)));
+    }
+
+    #[test]
+    fn monitor_lists_unknown_and_disconnected_peer_versions_without_legacy_label() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut config = Config {
+            node_name: "local".into(),
+            ..Config::default()
+        };
+        for name in ["modern", "older", "sleeping"] {
+            config.peers.push(crate::config::PeerConfig {
+                name: name.into(),
+                ssh_command: format!("ssh {name}"),
+            });
+        }
+        let mut app = monitor_app(config.clone(), receiver);
+        app.on_message(UiMessage::Status(Status {
+            running: true,
+            node_id: config.node_id,
+            node_name: config.node_name,
+            machine_name: "local-machine.local".into(),
+            clipboard_backend: "NSPasteboard".into(),
+            version: crate::update::CURRENT_VERSION.into(),
+            desired_version: crate::update::CURRENT_VERSION.into(),
+            configured_peers: vec!["modern".into(), "older".into(), "sleeping".into()],
+            connected_peers: vec!["modern".into(), "older".into()],
+            peers: vec![
+                PeerStatus {
+                    node_id: Uuid::new_v4(),
+                    name: "modern".into(),
+                    machine_name: Some("modern-machine.local".into()),
+                    version: Some(crate::update::CURRENT_VERSION.into()),
+                    desired_version: Some(crate::update::CURRENT_VERSION.into()),
+                },
+                PeerStatus {
+                    node_id: Uuid::new_v4(),
+                    name: "older".into(),
+                    machine_name: Some("older-machine.local".into()),
+                    version: None,
+                    desired_version: None,
+                },
+            ],
+        }));
+
+        let backend = TestBackend::new(150, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("MACHINE"));
+        assert!(rendered.contains("INSTALLED"));
+        assert!(rendered.contains("TARGET"));
+        assert!(rendered.contains("modern-machine.local"));
+        assert!(rendered.contains("older-machine.local"));
+        assert!(rendered.contains("version unknown · setup required"));
+        assert!(rendered.contains("sleeping"));
+        assert!(rendered.contains("reconnecting"));
+        assert!(!rendered.contains("legacy"));
+        assert!(rendered.contains("u notify updates"));
+    }
+
+    #[test]
+    fn monitor_reports_update_notifications() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut app = monitor_app(Config::default(), receiver);
+        app.update_pending = true;
+        app.on_message(UiMessage::UpdateNotified(UpdateNotification {
+            version: "1.2.3".into(),
+            notified_peers: 2,
+            version_unknown_peers: 1,
+        }));
+
+        assert!(!app.update_pending);
+        let notice = app.update_notice.as_deref().unwrap();
+        assert!(notice.contains("Announced v1.2.3 to 2 peers"));
+        assert!(notice.contains("1 connected peer cannot receive update events"));
     }
 }

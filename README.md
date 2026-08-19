@@ -40,6 +40,8 @@ ssh-clipboard update --check   # compare this node with npm @latest
 
 The manual update command also reconciles the per-user service, so it can recover an installed binary whose launchd or systemd job is missing.
 
+The monitor shows each machine on its own row with installed and target versions. Press `u` to queue an immediate npm check and notify every connected client that supports update events.
+
 Every installed daemon independently checks the stable npm release and gossips its verified desired version to connected peers. Any online machine can therefore trigger convergence; there is no permanent update coordinator. Packages are accepted only after npm SHA-512 integrity, the bundled SHA-256 manifest, executable target, and reported binary version all agree. Updates retain the previous executable, replace the live binary atomically, and explicitly ask launchd/systemd to restart the daemon.
 
 macOS and Linux · arm64 and x64 · Rust + [Ratatui](https://ratatui.rs)

@@ -51,6 +51,13 @@ pub struct Status {
     pub peers: Vec<PeerStatus>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateNotification {
+    pub version: String,
+    pub notified_peers: usize,
+    pub version_unknown_peers: usize,
+}
+
 fn legacy_version() -> String {
     "legacy".to_owned()
 }
@@ -362,6 +369,22 @@ impl Daemon {
             peers: peer_statuses,
         }
     }
+
+    async fn notify_updates(&self) -> UpdateNotification {
+        let peers = self.peers.read().await;
+        let notified_peers = peers.values().filter(|peer| peer.version.is_some()).count();
+        let version_unknown_peers = peers.len().saturating_sub(notified_peers);
+        drop(peers);
+
+        let version = self.desired_version.borrow().clone();
+        self.desired_version.send_replace(version.clone());
+        let _ = self.update_hints.send(version.clone());
+        UpdateNotification {
+            version,
+            notified_peers,
+            version_unknown_peers,
+        }
+    }
 }
 
 async fn next_clipboard_change(
@@ -493,6 +516,13 @@ async fn handle_local(
             stream.write_all(b"\n").await?;
             Ok(())
         }
+        "NOTIFY_UPDATE" => {
+            let encoded = serde_json::to_vec(&daemon.notify_updates().await)?;
+            let mut stream = buffered.into_inner();
+            stream.write_all(&encoded).await?;
+            stream.write_all(b"\n").await?;
+            Ok(())
+        }
         _ => bail!("unknown local socket command"),
     }
 }
@@ -582,6 +612,15 @@ pub async fn query_status() -> Result<Status> {
     let socket = paths()?.socket;
     let mut stream = UnixStream::connect(&socket).await?;
     stream.write_all(b"STATUS\n").await?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).await?;
+    Ok(serde_json::from_str(&line)?)
+}
+
+pub async fn notify_updates() -> Result<UpdateNotification> {
+    let socket = paths()?.socket;
+    let mut stream = UnixStream::connect(&socket).await?;
+    stream.write_all(b"NOTIFY_UPDATE\n").await?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).await?;
     Ok(serde_json::from_str(&line)?)
@@ -705,6 +744,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_update_command_queues_a_check_and_reports_peer_counts() {
+        let config = Config::default();
+        let clipboard = Arc::new(MockClipboard::default());
+        let (desired_tx, _) = watch::channel(CURRENT_VERSION.to_owned());
+        let (hint_tx, mut hint_rx) = mpsc::unbounded_channel();
+        let daemon = Daemon::with_updates(config, clipboard, desired_tx, hint_tx);
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(b"NOTIFY_UPDATE\n").await.unwrap();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        handle_local(daemon, server, shutdown_rx).await.unwrap();
+
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<UpdateNotification>(&line).unwrap(),
+            UpdateNotification {
+                version: CURRENT_VERSION.into(),
+                notified_peers: 0,
+                version_unknown_peers: 0,
+            }
+        );
+        assert_eq!(hint_rx.recv().await, Some(CURRENT_VERSION.into()));
+    }
+
+    #[tokio::test]
     async fn update_versions_are_announced_and_peer_hints_are_forwarded() {
         let config = Config::default();
         let max_bytes = config.max_bytes;
@@ -715,8 +780,9 @@ mod tests {
         let (mut peer, server) = duplex(4096);
         let (mut reader, mut writer) = split(server);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let serving_daemon = Arc::clone(&daemon);
         let task = tokio::spawn(async move {
-            daemon
+            serving_daemon
                 .serve_peer(&mut reader, &mut writer, "test", shutdown_rx, None)
                 .await
         });
@@ -745,6 +811,24 @@ mod tests {
         })
         .await
         .unwrap();
+        let notification = daemon.notify_updates().await;
+        assert_eq!(
+            notification,
+            UpdateNotification {
+                version: CURRENT_VERSION.into(),
+                notified_peers: 1,
+                version_unknown_peers: 0,
+            }
+        );
+        assert!(matches!(
+            read_message(&mut peer, max_bytes).await.unwrap(),
+            Message::UpdateAvailable { version, .. } if version == CURRENT_VERSION
+        ));
+        assert_eq!(
+            timeout(Duration::from_secs(1), hint_rx.recv()).await.unwrap(),
+            Some(CURRENT_VERSION.into())
+        );
+
         desired_tx.send("9.0.0".into()).unwrap();
         assert!(matches!(
             read_message(&mut peer, max_bytes).await.unwrap(),

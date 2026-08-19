@@ -129,11 +129,12 @@ async fn run() -> Result<()> {
                     }
                 }
                 for peer in status.peers {
-                    println!(
-                        "peer version: {} {}",
-                        peer.name,
-                        peer.version.as_deref().unwrap_or("legacy")
-                    );
+                    let version = peer
+                        .version
+                        .as_deref()
+                        .filter(|version| *version != "legacy" && !version.is_empty())
+                        .unwrap_or("unknown");
+                    println!("peer version: {} {}", peer.name, version);
                 }
             }
             Ok(())
