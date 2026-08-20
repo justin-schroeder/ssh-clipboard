@@ -7,14 +7,14 @@ at build time (no client-side data fetching; the JS only hydrates the copy butto
 
 ```sh
 cd docs
-npm install
-npm run dev
+pnpm install
+pnpm run dev
 ```
 
 ## Build
 
 ```sh
-npm run build   # vite build → SSR bundle → prerender → dist/
+pnpm run build   # vite build → SSR bundle → prerender → dist/
 ```
 
 `dist/index.html` contains the fully rendered page.
@@ -28,8 +28,8 @@ the Cloudflare dashboard:
 1. Workers & Pages → Create → **Workers** → Import a repository →
    `standardagents/ssh-clipboard`.
 2. Set **Root directory** to `docs`.
-3. Set **Build command** to `npm ci && npm run build`.
-4. Set **Deploy command** to `npx wrangler deploy` (it picks up `wrangler.jsonc`,
+3. Set **Build command** to `pnpm install --frozen-lockfile && pnpm run build`.
+4. Set **Deploy command** to `pnpm exec wrangler deploy` (it picks up `wrangler.jsonc`,
    which serves `dist/` as static assets).
 
 After that, every push to `main` that touches `docs/` triggers a build and deploy.
@@ -48,7 +48,7 @@ Worker queries the GitHub API server-side and caches the count at the edge for
 (5000 req/hr instead of 60):
 
 ```sh
-cd docs && npx wrangler secret put GITHUB_TOKEN
+cd docs && pnpm exec wrangler secret put GITHUB_TOKEN
 ```
 
 Use a fine-grained PAT with public repository read access only. Without the

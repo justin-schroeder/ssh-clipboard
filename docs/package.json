@@ -2,6 +2,7 @@
   "name": "ssh-clipboard-site",
   "private": true,
   "version": "0.0.0",
+  "packageManager": "pnpm@11.22.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host",
@@ -16,6 +17,7 @@
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.8",
     "@vue/server-renderer": "^3.5.41",
-    "vite": "^8.2.1"
+    "vite": "^8.2.1",
+    "wrangler": "^4.124.0"
   }
 }
