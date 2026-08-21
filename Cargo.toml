@@ -13,7 +13,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.100"
-async-trait = "0.1.89"
 base64 = "0.22.1"
 clap = { version = "4.5.50", features = ["derive"] }
 flate2 = "1.1.5"

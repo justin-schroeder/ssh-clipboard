@@ -3,7 +3,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -37,10 +36,9 @@ impl Snapshot {
     }
 }
 
-#[async_trait]
 pub trait ClipboardBackend: Send + Sync {
-    async fn capture(&self) -> Result<Option<Snapshot>>;
-    async fn apply(&self, representations: &[Representation]) -> Result<Snapshot>;
+    fn capture(&self) -> Result<Option<Snapshot>>;
+    fn apply(&self, representations: &[Representation]) -> Result<Snapshot>;
     fn name(&self) -> &'static str;
 
     fn change_receiver(&self, _interval: Duration) -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
@@ -258,13 +256,12 @@ impl NativeClipboard {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-#[async_trait]
 impl ClipboardBackend for NativeClipboard {
-    async fn capture(&self) -> Result<Option<Snapshot>> {
+    fn capture(&self) -> Result<Option<Snapshot>> {
         self.capture_sync()
     }
 
-    async fn apply(&self, representations: &[Representation]) -> Result<Snapshot> {
+    fn apply(&self, representations: &[Representation]) -> Result<Snapshot> {
         self.apply_sync(representations)
     }
 
@@ -429,30 +426,28 @@ fn add_portable_aliases(representations: &mut Vec<Representation>, mut remaining
 
 #[cfg(test)]
 pub mod test_support {
-    use tokio::sync::Mutex as AsyncMutex;
-
     use super::*;
 
     #[derive(Default)]
     pub struct MockClipboard {
-        snapshot: AsyncMutex<Option<Snapshot>>,
+        snapshot: Mutex<Option<Snapshot>>,
     }
 
-    impl MockClipboard {
-        pub async fn replace(&self, representations: Vec<Representation>) {
-            *self.snapshot.lock().await = Some(Snapshot::new(representations));
-        }
-    }
-
-    #[async_trait]
     impl ClipboardBackend for MockClipboard {
-        async fn capture(&self) -> Result<Option<Snapshot>> {
-            Ok(self.snapshot.lock().await.clone())
+        fn capture(&self) -> Result<Option<Snapshot>> {
+            Ok(self
+                .snapshot
+                .lock()
+                .map_err(|_| anyhow::anyhow!("mock clipboard lock poisoned"))?
+                .clone())
         }
 
-        async fn apply(&self, representations: &[Representation]) -> Result<Snapshot> {
+        fn apply(&self, representations: &[Representation]) -> Result<Snapshot> {
             let snapshot = Snapshot::new(representations.to_vec());
-            *self.snapshot.lock().await = Some(snapshot.clone());
+            *self
+                .snapshot
+                .lock()
+                .map_err(|_| anyhow::anyhow!("mock clipboard lock poisoned"))? = Some(snapshot.clone());
             Ok(snapshot)
         }
 

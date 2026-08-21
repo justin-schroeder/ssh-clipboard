@@ -14,7 +14,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::clipboard::{ClipboardBackend, NativeClipboard};
+use crate::clipboard::{ClipboardBackend, NativeClipboard, Snapshot};
 use crate::config::{Config, PeerConfig, detected_machine_name, ensure_private_dir, paths};
 use crate::filebundle;
 use crate::model::{Clip, Direction, MonitorEvent};
@@ -114,7 +114,7 @@ impl Daemon {
     }
 
     async fn watch_clipboard(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
-        let mut previous = self.clipboard.capture().await.ok().flatten();
+        let mut previous = self.capture_clipboard().await.ok().flatten();
         let poll = Duration::from_millis(self.config.poll_interval_ms);
         let mut changes = self.clipboard.change_receiver(poll);
         let mut interval = tokio::time::interval(Duration::from_millis(self.config.poll_interval_ms));
@@ -123,7 +123,7 @@ impl Daemon {
             tokio::select! {
                 () = next_clipboard_change(&mut changes, &mut interval) => {
                     let _guard = self.apply_lock.lock().await;
-                    let snapshot = match self.clipboard.capture().await {
+                    let snapshot = match self.capture_clipboard().await {
                         Ok(Some(snapshot)) => snapshot,
                         Ok(None) => continue,
                         Err(error) => {
@@ -283,14 +283,7 @@ impl Daemon {
         self.emit(Direction::Receive, Some(peer_name.to_owned()), &clip);
         self.broadcast_clip(Arc::clone(&clip), Some(source)).await;
         let _guard = self.apply_lock.lock().await;
-        let representations = match filebundle::materialize(clip.id, &clip.representations) {
-            Ok(representations) => representations,
-            Err(error) => {
-                warn!(%error, peer = %peer_name, clip = %clip.id, "failed to materialize copied files");
-                return;
-            }
-        };
-        match self.clipboard.apply(&representations).await {
+        match self.apply_clipboard(Arc::clone(&clip)).await {
             Ok(snapshot) => {
                 *self
                     .suppressed
@@ -301,6 +294,24 @@ impl Daemon {
             }
             Err(error) => warn!(%error, peer = %peer_name, clip = %clip.id, "failed to apply clipboard"),
         }
+    }
+
+    async fn capture_clipboard(&self) -> Result<Option<Snapshot>> {
+        let clipboard = Arc::clone(&self.clipboard);
+        tokio::task::spawn_blocking(move || clipboard.capture())
+            .await
+            .context("clipboard capture worker stopped")?
+    }
+
+    async fn apply_clipboard(&self, clip: Arc<Clip>) -> Result<Snapshot> {
+        let clipboard = Arc::clone(&self.clipboard);
+        tokio::task::spawn_blocking(move || {
+            let representations = filebundle::materialize(clip.id, &clip.representations)
+                .context("materialize copied files")?;
+            clipboard.apply(&representations)
+        })
+        .await
+        .context("clipboard apply worker stopped")?
     }
 
     async fn broadcast_clip(&self, clip: Arc<Clip>, except: Option<Uuid>) {
@@ -676,12 +687,96 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Condvar, Mutex as StdMutex};
+
     use tokio::io::{duplex, split};
+    use tokio::sync::oneshot;
     use tokio::time::timeout;
 
     use super::*;
     use crate::clipboard::test_support::MockClipboard;
     use crate::model::Representation;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum BlockingOperation {
+        Capture,
+        Apply,
+    }
+
+    struct BlockingClipboard {
+        operation: BlockingOperation,
+        started: StdMutex<Option<oneshot::Sender<()>>>,
+        released: StdMutex<bool>,
+        gate: Condvar,
+    }
+
+    impl BlockingClipboard {
+        fn new(operation: BlockingOperation) -> (Arc<Self>, oneshot::Receiver<()>) {
+            let (started, receiver) = oneshot::channel();
+            (
+                Arc::new(Self {
+                    operation,
+                    started: StdMutex::new(Some(started)),
+                    released: StdMutex::new(false),
+                    gate: Condvar::new(),
+                }),
+                receiver,
+            )
+        }
+
+        fn block(&self, operation: BlockingOperation) {
+            if self.operation != operation {
+                return;
+            }
+            if let Some(started) = self.started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            let released = self.released.lock().unwrap();
+            let (released, _) = self
+                .gate
+                .wait_timeout_while(released, Duration::from_secs(2), |released| !*released)
+                .unwrap();
+            drop(released);
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.gate.notify_all();
+        }
+    }
+
+    impl ClipboardBackend for BlockingClipboard {
+        fn capture(&self) -> Result<Option<Snapshot>> {
+            self.block(BlockingOperation::Capture);
+            Ok(None)
+        }
+
+        fn apply(&self, representations: &[Representation]) -> Result<Snapshot> {
+            self.block(BlockingOperation::Apply);
+            Ok(Snapshot::new(representations.to_vec()))
+        }
+
+        fn name(&self) -> &'static str {
+            "blocking mock"
+        }
+    }
+
+    async fn assert_status_is_responsive(daemon: Arc<Daemon>) {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(b"STATUS\n").await.unwrap();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let request = tokio::spawn(handle_local(daemon, server, shutdown_rx));
+        let mut line = String::new();
+        timeout(
+            Duration::from_millis(250),
+            BufReader::new(client).read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(serde_json::from_str::<Status>(&line).unwrap().running);
+        request.await.unwrap().unwrap();
+    }
 
     #[test]
     fn status_from_an_older_daemon_defaults_version_fields() {
@@ -920,7 +1015,7 @@ mod tests {
         assert_eq!(relayed, Message::Clip(clip.clone()));
         let applied = timeout(Duration::from_secs(1), async {
             loop {
-                if let Some(snapshot) = clipboard.capture().await.unwrap()
+                if let Some(snapshot) = clipboard.capture().unwrap()
                     && snapshot.representations == clip.representations
                 {
                     break snapshot;
@@ -931,6 +1026,55 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(applied.representations, clip.representations);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_capture_keeps_local_commands_responsive() {
+        let (clipboard, started) = BlockingClipboard::new(BlockingOperation::Capture);
+        let daemon = Daemon::new(Config::default(), clipboard.clone());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let watcher = tokio::spawn(Arc::clone(&daemon).watch_clipboard(shutdown_rx));
+        let wait_started = Instant::now();
+
+        timeout(Duration::from_millis(500), started)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(wait_started.elapsed() < Duration::from_millis(500));
+        assert_status_is_responsive(daemon).await;
+
+        clipboard.release();
+        shutdown_tx.send(true).unwrap();
+        watcher.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_apply_keeps_local_commands_responsive() {
+        let (clipboard, started) = BlockingClipboard::new(BlockingOperation::Apply);
+        let daemon = Daemon::new(Config::default(), clipboard.clone());
+        let clip = Arc::new(Clip::new(
+            Uuid::new_v4(),
+            vec![Representation {
+                item: 0,
+                format: "text/plain".into(),
+                data: b"responsive".to_vec(),
+            }],
+        ));
+        let applying_daemon = Arc::clone(&daemon);
+        let applying = tokio::spawn(async move {
+            applying_daemon.receive_clip(clip, "remote", Uuid::new_v4()).await;
+        });
+        let wait_started = Instant::now();
+
+        timeout(Duration::from_millis(500), started)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(wait_started.elapsed() < Duration::from_millis(500));
+        assert_status_is_responsive(daemon).await;
+
+        clipboard.release();
+        applying.await.unwrap();
     }
 
     #[test]
