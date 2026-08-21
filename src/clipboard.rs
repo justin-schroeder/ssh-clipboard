@@ -246,7 +246,8 @@ impl NativeClipboard {
             contents.push(ClipboardContent::Files(native_files));
         } else {
             let mut added_files = false;
-            let mut native_formats = NativeFormats::default();
+            #[cfg(target_os = "macos")]
+            let mut native_formats = MacosFormats::default();
             for representation in representations {
                 if representation.format.trim().is_empty()
                     || is_internal_marker(&representation.format)
@@ -263,9 +264,15 @@ impl NativeClipboard {
                     #[cfg(target_os = "macos")]
                     continue;
                 }
-                let Some(format) = native_formats.normalize(&representation.format) else {
-                    continue;
+                #[cfg(target_os = "macos")]
+                let format = {
+                    let Some(format) = native_formats.normalize(&representation.format) else {
+                        continue;
+                    };
+                    format
                 };
+                #[cfg(not(target_os = "macos"))]
+                let format = representation.format.clone();
                 contents.push(ClipboardContent::Other(format, representation.data.clone()));
             }
         }
@@ -426,20 +433,6 @@ impl MacosFormats {
     fn normalize(&mut self, format: &str) -> Option<String> {
         let format = macos_clipboard_format(format)?.to_owned();
         self.added.insert(format.clone()).then_some(format)
-    }
-}
-
-#[cfg(target_os = "macos")]
-type NativeFormats = MacosFormats;
-
-#[cfg(not(target_os = "macos"))]
-#[derive(Default)]
-struct NativeFormats;
-
-#[cfg(not(target_os = "macos"))]
-impl NativeFormats {
-    fn normalize(&mut self, format: &str) -> Option<String> {
-        Some(format.to_owned())
     }
 }
 
