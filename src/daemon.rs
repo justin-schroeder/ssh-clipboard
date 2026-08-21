@@ -114,11 +114,14 @@ impl Daemon {
     }
 
     async fn watch_clipboard(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
-        let mut previous = self.capture_clipboard().await.ok().flatten();
         let poll = Duration::from_millis(self.config.poll_interval_ms);
         let mut changes = self.clipboard.change_receiver(poll);
         let mut interval = tokio::time::interval(Duration::from_millis(self.config.poll_interval_ms));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut previous = {
+            let _guard = self.apply_lock.lock().await;
+            self.capture_clipboard().await.ok().flatten()
+        };
         loop {
             tokio::select! {
                 () = next_clipboard_change(&mut changes, &mut interval) => {
@@ -703,6 +706,61 @@ mod tests {
         gate: Condvar,
     }
 
+    struct InitialCaptureClipboard {
+        capture_started: StdMutex<Option<oneshot::Sender<()>>>,
+        apply_started: StdMutex<Option<oneshot::Sender<()>>>,
+        released: StdMutex<bool>,
+        gate: Condvar,
+    }
+
+    impl InitialCaptureClipboard {
+        fn new() -> (Arc<Self>, oneshot::Receiver<()>, oneshot::Receiver<()>) {
+            let (capture_started, capture_receiver) = oneshot::channel();
+            let (apply_started, apply_receiver) = oneshot::channel();
+            (
+                Arc::new(Self {
+                    capture_started: StdMutex::new(Some(capture_started)),
+                    apply_started: StdMutex::new(Some(apply_started)),
+                    released: StdMutex::new(false),
+                    gate: Condvar::new(),
+                }),
+                capture_receiver,
+                apply_receiver,
+            )
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.gate.notify_all();
+        }
+    }
+
+    impl ClipboardBackend for InitialCaptureClipboard {
+        fn capture(&self) -> Result<Option<Snapshot>> {
+            if let Some(started) = self.capture_started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            let released = self.released.lock().unwrap();
+            let (released, _) = self
+                .gate
+                .wait_timeout_while(released, Duration::from_secs(2), |released| !*released)
+                .unwrap();
+            drop(released);
+            Ok(None)
+        }
+
+        fn apply(&self, representations: &[Representation]) -> Result<Snapshot> {
+            if let Some(started) = self.apply_started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            Ok(Snapshot::new(representations.to_vec()))
+        }
+
+        fn name(&self) -> &'static str {
+            "initial capture mock"
+        }
+    }
+
     impl BlockingClipboard {
         fn new(operation: BlockingOperation) -> (Arc<Self>, oneshot::Receiver<()>) {
             let (started, receiver) = oneshot::channel();
@@ -1037,6 +1095,51 @@ mod tests {
         assert_status_is_responsive(daemon).await;
 
         clipboard.release();
+        shutdown_tx.send(true).unwrap();
+        watcher.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn initial_capture_is_serialized_with_remote_apply() {
+        let (clipboard, capture_started, apply_started) = InitialCaptureClipboard::new();
+        let daemon = Daemon::new(Config::default(), clipboard.clone());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let watcher = tokio::spawn(Arc::clone(&daemon).watch_clipboard(shutdown_rx));
+        timeout(Duration::from_millis(500), capture_started)
+            .await
+            .unwrap()
+            .unwrap();
+        let applying_daemon = Arc::clone(&daemon);
+        let applying = tokio::spawn(async move {
+            applying_daemon
+                .receive_clip(
+                    Arc::new(Clip::new(
+                        Uuid::new_v4(),
+                        vec![Representation {
+                            item: 0,
+                            format: "text/plain".into(),
+                            data: b"remote".to_vec(),
+                        }],
+                    )),
+                    "remote",
+                    Uuid::new_v4(),
+                )
+                .await;
+        });
+        let mut apply_started = Box::pin(apply_started);
+
+        assert!(
+            timeout(Duration::from_millis(100), &mut apply_started)
+                .await
+                .is_err()
+        );
+        clipboard.release();
+        timeout(Duration::from_millis(500), &mut apply_started)
+            .await
+            .unwrap()
+            .unwrap();
+
+        applying.await.unwrap();
         shutdown_tx.send(true).unwrap();
         watcher.await.unwrap();
     }
