@@ -43,8 +43,8 @@ async function submit() {
       <span class="text-[0.72rem] tracking-[0.14em] text-mint">[ early access ]</span>
     </div>
     <p class="mb-5 max-w-[52rem] text-[0.92rem] leading-[1.7] text-dim">
-      Standard Agents is an open standard for creating domain-specific agents you can
-      distribute and compose. It comes from the team behind
+      Standard Agents is an open standard for domain-specific agents you can
+      distribute and compose. From the team behind
       <a class="border-b border-linebright text-ink transition-colors hover:border-mint hover:text-mint" href="https://formkit.com">FormKit</a>,
       <a class="border-b border-linebright text-ink transition-colors hover:border-mint hover:text-mint" href="https://tempo.formkit.com">Tempo</a>,
       <a class="border-b border-linebright text-ink transition-colors hover:border-mint hover:text-mint" href="https://dmux.ai">dmux</a>,

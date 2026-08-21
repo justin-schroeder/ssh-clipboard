@@ -37,27 +37,27 @@ onBeforeUnmount(() => observer?.disconnect())
 const features = [
   {
     name: 'native',
-    text: 'Writes the real system clipboard: the macOS pasteboard, and Wayland or X11 on Linux.',
+    text: 'Writes the real system clipboard: NSPasteboard on macOS, Wayland or X11 on Linux.',
   },
   {
     name: 'private',
-    text: 'Persistent peer-to-peer SSH. No relay, no account, no open port, no new encryption key to manage.',
+    text: 'Persistent peer-to-peer SSH. No relay, no account, no open port, no new encryption key.',
   },
   {
     name: 'faithful',
-    text: 'Preserves every available clipboard representation: rich text, images, and files.',
+    text: 'Ships every clipboard representation: rich text, images, files.',
   },
   {
     name: 'invisible',
-    text: 'Raycast and other clipboard managers see ordinary system clipboard writes. There is nothing to configure.',
+    text: 'Raycast and other clipboard managers see ordinary clipboard writes. Nothing to configure.',
   },
   {
     name: 'fast',
-    text: 'Sends raw bytes over persistent connections, with deduplication and newest-value queues.',
+    text: 'Sends raw bytes over persistent connections through deduplicated, newest-value queues.',
   },
   {
     name: 'self-updating',
-    text: 'Daemons gossip verified versions peer to peer and converge on the latest stable release without a central coordinator.',
+    text: 'Daemons gossip verified versions and converge on the latest stable release. No central coordinator.',
   },
 ]
 
@@ -109,13 +109,13 @@ const docLink =
 
   <main id="top">
     <!-- ── hero ─────────────────────────────── -->
-    <section class="relative px-5 pb-16 pt-24 text-left max-xl:text-center max-md:pt-14">
+    <section class="relative overflow-x-clip px-5 pb-24 pt-32 text-left max-xl:text-center max-md:pt-16">
       <div
         class="mx-auto grid w-[min(90rem,calc(100vw-7rem))] grid-cols-[minmax(21rem,27rem)_minmax(0,1fr)] items-center gap-16 max-xl:grid-cols-1 max-md:gap-8 max-md:w-[calc(100vw-2.5rem)]"
       >
         <div>
           <h1
-            class="mb-8 text-[clamp(2.6rem,4.2vw,4.1rem)] font-semibold leading-[1.12] tracking-[-0.03em] text-bright"
+            class="mb-8 text-[clamp(2.8rem,5.2vw,4.1rem)] font-semibold leading-[1.12] tracking-[-0.03em] text-bright"
           >
             <span>copy/paste,</span><br />
             <span class="text-mint">everywhere.</span>
@@ -129,7 +129,7 @@ const docLink =
         </div>
         <div class="relative isolate min-w-0">
           <div
-            class="dither pointer-events-none absolute -inset-x-48 -inset-y-28 -z-10 text-mint opacity-[0.13] [mask-image:radial-gradient(70%_78%_at_50%_46%,black,transparent_82%)]"
+            class="dither pointer-events-none absolute -inset-x-48 -inset-y-28 -z-10 text-mint opacity-[0.13] [mask-image:radial-gradient(70%_78%_at_50%_46%,black,transparent_82%)] max-md:-inset-x-3"
           ></div>
           <MeshDemo />
         </div>
@@ -172,8 +172,7 @@ const docLink =
             <span class="text-mint">#</span> Install
           </h2>
           <p class="mb-4 max-w-[42rem]">
-            One package, two commands. The npm package installs a native Rust binary
-            with a per-user background service
+            The npm package installs a native Rust binary and a per-user service
             (<code>launchd</code> on macOS, <code>systemd</code> on Linux).
           </p>
           <CodeBlock
@@ -185,9 +184,8 @@ $ ssh-clipboard"
             <li>macOS or Linux (Wayland or X11), on arm64 or x64</li>
             <li>Node ≥ 18 for <code>npm install</code>; the daemon has no Node dependency</li>
             <li>
-              Passwordless SSH between your machines.
-              <a :class="docLink" href="https://tailscale.com/kb/1193/tailscale-ssh">Tailscale SSH</a> is perfect,
-              and plain <code>~/.ssh</code> keys work too
+              <a :class="docLink" href="https://tailscale.com/kb/1193/tailscale-ssh">Tailscale SSH</a>
+              is recommended but passwordless <code>~/.ssh</code> keys work too
             </li>
           </ul>
         </section>
@@ -197,14 +195,14 @@ $ ssh-clipboard"
             <span class="text-mint">#</span> Quick start
           </h2>
           <p class="mb-4 max-w-[42rem]">
-            Run <code>ssh-clipboard</code> with no arguments. The first-run TUI offers compatible
-            online machines from Tailscale when it's installed, or accepts any passwordless SSH
-            destination. For each peer it:
+            Run <code>ssh-clipboard</code> with no arguments. The first-run TUI lists compatible
+            online Tailscale machines, or accepts any passwordless SSH destination.
+            For each peer it:
           </p>
           <ol class="mb-4 ml-6 list-decimal space-y-1.5">
-            <li>verifies the connection actually works,</li>
-            <li>installs the right native binary for that platform over SSH,</li>
-            <li>starts the per-user background service on both ends.</li>
+            <li>verifies the connection,</li>
+            <li>installs the right binary over SSH,</li>
+            <li>starts the per-user service on both ends.</li>
           </ol>
           <p class="mb-4 max-w-[42rem]">
             Copy on one machine, paste on another. After setup it behaves like one clipboard.
@@ -222,9 +220,13 @@ connected: macbookserver"
             <span class="text-mint">#</span> Commands
           </h2>
           <dl class="my-8 overflow-hidden border border-line">
-            <template v-for="c in commands" :key="c.cmd">
+            <template v-for="(c, i) in commands" :key="c.cmd">
               <dt class="bg-panel px-5 pt-4">
-                <code class="border-0 bg-transparent p-0 font-semibold text-mint">{{ c.cmd }}</code>
+                <code class="border-0 bg-transparent p-0 font-semibold">
+                  <span :class="i === 0 ? 'text-mint' : 'text-bright'">ssh-clipboard</span><span
+                    class="text-mint"
+                  >{{ c.cmd.slice('ssh-clipboard'.length) }}</span>
+                </code>
               </dt>
               <dd class="border-b border-line bg-panel px-5 pb-4 pt-1 text-[0.88rem] text-dim last:border-b-0">
                 {{ c.desc }}
@@ -232,10 +234,9 @@ connected: macbookserver"
             </template>
           </dl>
           <p class="mb-4 max-w-[42rem]">
-            Everything human-readable has a machine-readable twin:
+            Every command has a machine-readable twin:
             <code>status --json</code> for health checks,
-            <code>monitor --json</code> for a newline-delimited event stream you can pipe into
-            whatever you're building.
+            <code>monitor --json</code> for an NDJSON event stream you can pipe anywhere.
           </p>
         </section>
 
@@ -249,17 +250,14 @@ connected: macbookserver"
 │  pasteboard  │    persistent · deduplicated  │ wayland/x11  │
 └──────────────┘         newest-wins           └──────────────┘</pre>
           <p class="mb-4 max-w-[42rem]">
-            A small Rust daemon on each machine watches the system clipboard through native
-            backends: the macOS pasteboard, or Wayland/X11 on Linux. When the clipboard
-            changes, it ships the raw bytes of <em>every available representation</em> to its
-            peers over persistent SSH connections and writes them back natively on the other
-            side.
+            A small Rust daemon on each machine watches the system clipboard through
+            native backends. On change, it ships the raw bytes of
+            <em>every representation</em> to its peers over persistent SSH and writes
+            them back natively.
           </p>
           <p class="mb-4 max-w-[42rem]">
-            There's no relay server, no cloud account, and no new cryptography. Transport
-            security is exactly the SSH trust you already have between your machines. Values
-            are deduplicated, and per-peer queues always deliver the newest value rather than
-            replaying history.
+            No relay, cloud account, additional port forwarding required. Values are
+            deduplicated, and per-peer queues always deliver the newest value.
           </p>
         </section>
 
@@ -268,15 +266,15 @@ connected: macbookserver"
             <span class="text-mint">#</span> Updates
           </h2>
           <p class="mb-4 max-w-[42rem]">
-            Every daemon independently checks npm for the latest stable release and gossips
-            its verified desired version to connected peers, so any online machine can trigger
-            the whole mesh to converge. There is no permanent update coordinator.
+            Each daemon checks npm for the latest stable release and tells its peers
+            what it found, so any machine that's online can update the whole mesh.
+            There's no central update server.
           </p>
           <p class="mb-4 max-w-[42rem]">
-            Packages are accepted only after the npm SHA-512 integrity hash, the bundled
-            SHA-256 manifest, the executable target, and the reported binary version all
-            agree. Updates keep the previous executable around, swap the live binary
-            atomically, and let launchd/systemd restart the daemon.
+            Before installing anything, a daemon verifies the npm SHA-512 hash, the
+            bundled SHA-256 manifest, the executable target, and the version the binary
+            actually reports. Updates keep the old executable around, swap the new one
+            in atomically, and let launchd or systemd restart the daemon.
           </p>
           <CodeBlock
             code="$ ssh-clipboard update --check

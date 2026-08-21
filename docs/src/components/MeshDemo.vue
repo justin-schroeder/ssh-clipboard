@@ -533,8 +533,11 @@ function layout(w) {
     for (const n of ['fedora', 'mini', 'debian']) {
       wires[n] = curve({ x: cx(nodes[n]), y: mon.y + mon.h }, { x: cx(nodes[n]), y: nodes[n].y }, true)
     }
-    deskARect = { x: (w - SCENE_W * sceneScale) / 2, y: 8 }
-    deskBRect = { x: (w - SCENE_W * sceneScale) / 2, y: mon.y + mon.h - SCENE_H * sceneScale + 24 }
+    // narrow: pop-up desktops cover the monitor area cleanly
+    const dx = (w - SCENE_W * sceneScale) / 2
+    const dy = mon.y + (mon.h - SCENE_H * sceneScale) / 2
+    deskARect = { x: dx, y: dy }
+    deskBRect = { x: dx, y: dy }
   }
   return { w, H, fs, mon, nodes, wires, wide, sceneScale, deskARect, deskBRect }
 }
