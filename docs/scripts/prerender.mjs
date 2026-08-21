@@ -1,5 +1,5 @@
 // Renders the Vue app to static HTML after `vite build`.
-// Run via `npm run build`; expects dist/ (client) and dist-ssr/ (server bundle).
+// Run via `pnpm run build`; expects dist/ (client) and dist-ssr/ (server bundle).
 import { readFile, writeFile, rm } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 
