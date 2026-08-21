@@ -122,7 +122,7 @@ const docLink =
           </h1>
           <p class="mb-10 max-w-[38rem] text-[1.05rem] leading-[1.85] text-dim max-xl:mx-auto">
             Peer-to-peer clipboard sync over SSH.
-            Copy anything on one machine, paste on another.
+            Copy anything on one machine, paste on another. Open source, and
             <span class="text-mint">Written in Rust ackchyually.</span>
           </p>
           <InstallPill />
