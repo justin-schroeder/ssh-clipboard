@@ -256,59 +256,72 @@ impl Daemon {
             established.store(true, Ordering::Release);
         }
 
-        let result = loop {
-            tokio::select! {
-                incoming = read_message(reader, self.config.max_bytes) => {
-                    match incoming {
-                        Ok(Message::Clip(clip)) => self.receive_clip(Arc::new(clip), &node_name, connection_id).await,
-                        Ok(Message::Hello { .. }) => {
-                            break Err(anyhow::anyhow!("peer sent a second hello"));
-                        }
-                        Ok(Message::UpdateAvailable { version, .. }) => {
-                            if let Some(peer) = self.peers.write().await.get_mut(&connection_id) {
-                                peer.desired_version = Some(version.clone());
-                            }
-                            if update::newer_version(CURRENT_VERSION, &version) {
-                                let _ = self.update_hints.send(version);
-                            }
-                        }
-                        Err(error) => break Err(error.into()),
+        let read_loop = async {
+            loop {
+                match read_message(reader, self.config.max_bytes).await {
+                    Ok(Message::Clip(clip)) => {
+                        self.receive_clip(Arc::new(clip), &node_name, connection_id).await;
                     }
+                    Ok(Message::Hello { .. }) => {
+                        break Err(anyhow::anyhow!("peer sent a second hello"));
+                    }
+                    Ok(Message::UpdateAvailable { version, .. }) => {
+                        if let Some(peer) = self.peers.write().await.get_mut(&connection_id) {
+                            peer.desired_version = Some(version.clone());
+                        }
+                        if update::newer_version(CURRENT_VERSION, &version) {
+                            let _ = self.update_hints.send(version);
+                        }
+                    }
+                    Err(error) => break Err(error.into()),
                 }
-                changed = receiver.changed() => {
-                    if changed.is_err() {
-                        break Ok(());
+            }
+        };
+        let write_loop = async {
+            loop {
+                tokio::select! {
+                    changed = receiver.changed() => {
+                        if changed.is_err() {
+                            break Ok(());
+                        }
+                        let clip = receiver.borrow_and_update().clone();
+                        if let Some(clip) = clip {
+                            if let Err(error) = write_clip(writer, &clip, self.config.max_bytes).await {
+                                break Err(error.into());
+                            }
+                            self.emit(Direction::Send, Some(node_name.clone()), &clip);
+                        }
                     }
-                    let clip = receiver.borrow_and_update().clone();
-                    if let Some(clip) = clip {
-                        if let Err(error) = write_clip(writer, &clip, self.config.max_bytes).await {
+                    changed = desired_updates.changed(), if app_version.is_some() => {
+                        if changed.is_err() {
+                            break Ok(());
+                        }
+                        let version = desired_updates.borrow_and_update().clone();
+                        if let Err(error) = write_message(
+                            writer,
+                            &Message::UpdateAvailable {
+                                update_id: Uuid::new_v4(),
+                                version,
+                            },
+                            self.config.max_bytes,
+                        ).await {
                             break Err(error.into());
                         }
-                        self.emit(Direction::Send, Some(node_name.clone()), &clip);
-                    }
-                }
-                changed = desired_updates.changed(), if app_version.is_some() => {
-                    if changed.is_err() {
-                        break Ok(());
-                    }
-                    let version = desired_updates.borrow_and_update().clone();
-                    if let Err(error) = write_message(
-                        writer,
-                        &Message::UpdateAvailable {
-                            update_id: Uuid::new_v4(),
-                            version,
-                        },
-                        self.config.max_bytes,
-                    ).await {
-                        break Err(error.into());
-                    }
-                }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        break Ok(());
                     }
                 }
             }
+        };
+        let shutdown_loop = async {
+            loop {
+                if *shutdown.borrow() || shutdown.changed().await.is_err() {
+                    break;
+                }
+            }
+        };
+        let result = tokio::select! {
+            result = read_loop => result,
+            result = write_loop => result,
+            () = shutdown_loop => Ok(()),
         };
         self.peers.write().await.remove(&connection_id);
         info!(peer = %node_name, "peer disconnected");
@@ -750,10 +763,12 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
     use std::sync::{Condvar, Mutex as StdMutex};
+    use std::task::{Context as TaskContext, Poll};
 
     use tokio::io::{duplex, split};
-    use tokio::sync::oneshot;
+    use tokio::sync::{Barrier, oneshot};
     use tokio::time::timeout;
 
     use super::*;
@@ -778,6 +793,65 @@ mod tests {
         apply_started: StdMutex<Option<oneshot::Sender<()>>>,
         released: StdMutex<bool>,
         gate: Condvar,
+    }
+
+    struct GatedWriter<W> {
+        inner: W,
+        armed: Arc<AtomicBool>,
+        gate: Arc<Barrier>,
+        waiting: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+        released: bool,
+    }
+
+    impl<W> GatedWriter<W> {
+        fn new(inner: W, armed: Arc<AtomicBool>, gate: Arc<Barrier>) -> Self {
+            Self {
+                inner,
+                armed,
+                gate,
+                waiting: None,
+                released: false,
+            }
+        }
+    }
+
+    impl<W> AsyncWrite for GatedWriter<W>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if this.armed.load(Ordering::Acquire) && !this.released {
+                if this.waiting.is_none() {
+                    let gate = Arc::clone(&this.gate);
+                    this.waiting = Some(Box::pin(async move {
+                        gate.wait().await;
+                    }));
+                }
+                if this
+                    .waiting
+                    .as_mut()
+                    .is_some_and(|waiting| waiting.as_mut().poll(context).is_pending())
+                {
+                    return Poll::Pending;
+                }
+                this.waiting = None;
+                this.released = true;
+            }
+            Pin::new(&mut this.inner).poll_write(context, buffer)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+        }
     }
 
     impl InitialCaptureClipboard {
@@ -1144,6 +1218,111 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(applied.representations, clip.representations);
+    }
+
+    #[tokio::test]
+    async fn simultaneous_large_peer_writes_keep_readers_active() {
+        let left_config = Config {
+            node_name: "left".into(),
+            ..Config::default()
+        };
+        let right_config = Config {
+            node_name: "right".into(),
+            ..Config::default()
+        };
+        let left_clipboard = Arc::new(MockClipboard::default());
+        let right_clipboard = Arc::new(MockClipboard::default());
+        let left_daemon = Daemon::new(left_config.clone(), left_clipboard.clone());
+        let right_daemon = Daemon::new(right_config.clone(), right_clipboard.clone());
+        let (left_stream, right_stream) = duplex(1024);
+        let (mut left_reader, left_writer) = split(left_stream);
+        let (mut right_reader, right_writer) = split(right_stream);
+        let armed = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(Barrier::new(2));
+        let mut left_writer = GatedWriter::new(left_writer, Arc::clone(&armed), Arc::clone(&gate));
+        let mut right_writer = GatedWriter::new(right_writer, Arc::clone(&armed), Arc::clone(&gate));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let left_session = {
+            let daemon = Arc::clone(&left_daemon);
+            let shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                daemon
+                    .serve_peer(&mut left_reader, &mut left_writer, "right", shutdown, None)
+                    .await
+            })
+        };
+        let right_session = {
+            let daemon = Arc::clone(&right_daemon);
+            tokio::spawn(async move {
+                daemon
+                    .serve_peer(&mut right_reader, &mut right_writer, "left", shutdown_rx, None)
+                    .await
+            })
+        };
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let left_connected = left_daemon.status().await.connected_peers == ["right"];
+                let right_connected = right_daemon.status().await.connected_peers == ["left"];
+                if left_connected && right_connected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let left_clip = Arc::new(Clip::new(
+            left_config.node_id,
+            vec![Representation {
+                item: 0,
+                format: "application/octet-stream".into(),
+                data: vec![0x11; 64 * 1024],
+            }],
+        ));
+        let right_clip = Arc::new(Clip::new(
+            right_config.node_id,
+            vec![Representation {
+                item: 0,
+                format: "application/octet-stream".into(),
+                data: vec![0x22; 64 * 1024],
+            }],
+        ));
+        let expected_left = right_clip.representations.clone();
+        let expected_right = left_clip.representations.clone();
+        armed.store(true, Ordering::Release);
+        tokio::join!(
+            left_daemon.broadcast_clip(left_clip, None),
+            right_daemon.broadcast_clip(right_clip, None)
+        );
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let left_applied = left_clipboard
+                    .capture()
+                    .unwrap()
+                    .is_some_and(|snapshot| snapshot.representations == expected_left);
+                let right_applied = right_clipboard
+                    .capture()
+                    .unwrap()
+                    .is_some_and(|snapshot| snapshot.representations == expected_right);
+                if left_applied && right_applied {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        shutdown_tx.send(true).unwrap();
+        timeout(Duration::from_secs(1), async {
+            let _ = left_session.await.unwrap();
+            let _ = right_session.await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
