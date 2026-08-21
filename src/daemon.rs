@@ -22,7 +22,7 @@ use crate::protocol::{Message, read_message, write_clip, write_message};
 use crate::ssh;
 use crate::update::{self, CURRENT_VERSION};
 
-const WATCHER_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+const WATCHER_STARTUP_RECONCILE_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerStatus {
@@ -120,12 +120,7 @@ impl Daemon {
     async fn watch_clipboard(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
         let poll = Duration::from_millis(self.config.poll_interval_ms);
         let mut changes = self.clipboard.change_receiver(poll);
-        let interval_poll = if changes.is_some() {
-            poll.max(WATCHER_RECONCILE_INTERVAL)
-        } else {
-            poll
-        };
-        let mut interval = tokio::time::interval(interval_poll);
+        let mut interval = tokio::time::interval(poll);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         {
             let _guard = self.apply_lock.lock().await;
@@ -133,9 +128,12 @@ impl Daemon {
             *self.last_clipboard.lock().await = initial.map(|snapshot| snapshot.fingerprint);
         }
         interval.reset();
+        let mut startup_reconcile = changes
+            .as_ref()
+            .map(|_| tokio::time::Instant::now() + WATCHER_STARTUP_RECONCILE_DELAY);
         loop {
             tokio::select! {
-                () = next_clipboard_change(&mut changes, &mut interval) => {
+                () = next_clipboard_change(&mut changes, &mut interval, &mut startup_reconcile) => {
                     let _guard = self.apply_lock.lock().await;
                     let snapshot = match self.capture_clipboard().await {
                         Ok(Some(snapshot)) => snapshot,
@@ -414,16 +412,28 @@ impl Daemon {
     }
 }
 
-async fn next_clipboard_change(changes: &mut Option<ChangeReceiver>, interval: &mut tokio::time::Interval) {
+async fn next_clipboard_change(
+    changes: &mut Option<ChangeReceiver>,
+    interval: &mut tokio::time::Interval,
+    startup_reconcile: &mut Option<tokio::time::Instant>,
+) {
     if let Some(receiver) = changes {
-        let change = tokio::select! {
-            change = receiver.recv() => change,
-            _ = interval.tick() => return,
+        let change = if let Some(deadline) = *startup_reconcile {
+            tokio::select! {
+                change = receiver.recv() => change,
+                () = tokio::time::sleep_until(deadline) => {
+                    *startup_reconcile = None;
+                    return;
+                }
+            }
+        } else {
+            receiver.recv().await
         };
         if change.is_some() {
             return;
         }
         *changes = None;
+        interval.reset();
     }
     interval.tick().await;
 }
