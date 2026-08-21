@@ -77,7 +77,7 @@ struct Daemon {
     clipboard: Arc<dyn ClipboardBackend>,
     peers: RwLock<HashMap<Uuid, PeerLink>>,
     seen: Mutex<HashMap<Uuid, Instant>>,
-    suppressed: Mutex<HashMap<[u8; 32], usize>>,
+    suppressed: Mutex<Option<[u8; 32]>>,
     apply_lock: Mutex<()>,
     events: broadcast::Sender<MonitorEvent>,
     desired_version: watch::Sender<String>,
@@ -105,7 +105,7 @@ impl Daemon {
             clipboard,
             peers: RwLock::new(HashMap::new()),
             seen: Mutex::new(HashMap::new()),
-            suppressed: Mutex::new(HashMap::new()),
+            suppressed: Mutex::new(None),
             apply_lock: Mutex::new(()),
             events,
             desired_version,
@@ -135,15 +135,9 @@ impl Daemon {
                         continue;
                     }
                     previous = Some(snapshot.clone());
-                    let mut suppressed = self.suppressed.lock().await;
-                    if let Some(count) = suppressed.get_mut(&snapshot.fingerprint) {
-                        *count -= 1;
-                        if *count == 0 {
-                            suppressed.remove(&snapshot.fingerprint);
-                        }
+                    if self.take_suppressed(snapshot.fingerprint).await {
                         continue;
                     }
-                    drop(suppressed);
                     let clip = Arc::new(Clip::new(self.config.node_id, snapshot.representations));
                     self.mark_seen(clip.id).await;
                     self.emit(Direction::Local, None, &clip);
@@ -285,12 +279,7 @@ impl Daemon {
         let _guard = self.apply_lock.lock().await;
         match self.apply_clipboard(Arc::clone(&clip)).await {
             Ok(snapshot) => {
-                *self
-                    .suppressed
-                    .lock()
-                    .await
-                    .entry(snapshot.fingerprint)
-                    .or_default() += 1;
+                *self.suppressed.lock().await = Some(snapshot.fingerprint);
             }
             Err(error) => warn!(%error, peer = %peer_name, clip = %clip.id, "failed to apply clipboard"),
         }
@@ -336,6 +325,10 @@ impl Daemon {
             seen.retain(|_, instant| *instant >= cutoff);
         }
         true
+    }
+
+    async fn take_suppressed(&self, fingerprint: [u8; 32]) -> bool {
+        self.suppressed.lock().await.take() == Some(fingerprint)
     }
 
     fn emit(&self, direction: Direction, peer: Option<String>, clip: &Clip) {
@@ -1075,6 +1068,36 @@ mod tests {
 
         clipboard.release();
         applying.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_the_latest_remote_fingerprint_is_suppressed() {
+        let clipboard = Arc::new(MockClipboard::default());
+        let daemon = Daemon::new(Config::default(), clipboard);
+        let first = Arc::new(Clip::new(
+            Uuid::new_v4(),
+            vec![Representation {
+                item: 0,
+                format: "text/plain".into(),
+                data: b"first".to_vec(),
+            }],
+        ));
+        let second = Arc::new(Clip::new(
+            Uuid::new_v4(),
+            vec![Representation {
+                item: 0,
+                format: "text/plain".into(),
+                data: b"second".to_vec(),
+            }],
+        ));
+        let first_fingerprint = Snapshot::new(first.representations.clone()).fingerprint;
+        let second_fingerprint = Snapshot::new(second.representations.clone()).fingerprint;
+
+        daemon.receive_clip(first, "remote", Uuid::new_v4()).await;
+        daemon.receive_clip(second, "remote", Uuid::new_v4()).await;
+
+        assert!(daemon.take_suppressed(second_fingerprint).await);
+        assert!(!daemon.take_suppressed(first_fingerprint).await);
     }
 
     #[test]
