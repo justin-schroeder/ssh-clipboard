@@ -3,7 +3,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -37,14 +36,38 @@ impl Snapshot {
     }
 }
 
-#[async_trait]
 pub trait ClipboardBackend: Send + Sync {
-    async fn capture(&self) -> Result<Option<Snapshot>>;
-    async fn apply(&self, representations: &[Representation]) -> Result<Snapshot>;
+    fn capture(&self) -> Result<Option<Snapshot>>;
+    fn apply(&self, representations: &[Representation]) -> Result<Snapshot>;
     fn name(&self) -> &'static str;
 
-    fn change_receiver(&self, _interval: Duration) -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
+    fn change_receiver(&self, _interval: Duration) -> Option<ChangeReceiver> {
         None
+    }
+}
+
+pub struct ChangeReceiver {
+    receiver: tokio::sync::mpsc::Receiver<()>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    _shutdown: Option<clipboard_rs::WatcherShutdown>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    _thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ChangeReceiver {
+    pub async fn recv(&mut self) -> Option<()> {
+        self.receiver.recv().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(receiver: tokio::sync::mpsc::Receiver<()>) -> Self {
+        Self {
+            receiver,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            _shutdown: None,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            _thread: None,
+        }
     }
 }
 
@@ -55,12 +78,12 @@ pub struct NativeClipboard {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-struct ChangeHandler(tokio::sync::mpsc::UnboundedSender<()>);
+struct ChangeHandler(tokio::sync::mpsc::Sender<()>);
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl ClipboardHandler for ChangeHandler {
     fn on_clipboard_change(&mut self) {
-        let _ = self.0.send(());
+        let _ = self.0.try_send(());
     }
 }
 
@@ -68,7 +91,7 @@ impl ClipboardHandler for ChangeHandler {
 impl NativeClipboard {
     pub fn new(max_bytes: u64) -> Result<Self> {
         use clipboard_rs::ClipboardContext;
-        let context = ClipboardContext::new()
+        let context = run_native_operation(ClipboardContext::new)
             .map_err(|error| anyhow::anyhow!("initialize native clipboard: {error}"))?;
         Ok(Self {
             context: Mutex::new(context),
@@ -223,6 +246,10 @@ impl NativeClipboard {
             contents.push(ClipboardContent::Files(native_files));
         } else {
             let mut added_files = false;
+            #[cfg(target_os = "macos")]
+            let mut native_formats = MacosFormats::default();
+            #[cfg(target_os = "linux")]
+            let mut native_formats = LinuxFormats::default();
             for representation in representations {
                 if representation.format.trim().is_empty()
                     || is_internal_marker(&representation.format)
@@ -230,15 +257,34 @@ impl NativeClipboard {
                 {
                     continue;
                 }
-                if is_file_format(&representation.format) && !added_files && !native_files.is_empty() {
-                    contents.push(ClipboardContent::Files(native_files.clone()));
-                    added_files = true;
+                if is_file_format(&representation.format) {
+                    if !added_files && !native_files.is_empty() {
+                        contents.push(ClipboardContent::Files(native_files.clone()));
+                        added_files = true;
+                        continue;
+                    }
+                    #[cfg(target_os = "macos")]
                     continue;
                 }
-                contents.push(ClipboardContent::Other(
-                    representation.format.clone(),
-                    representation.data.clone(),
-                ));
+                #[cfg(target_os = "linux")]
+                match native_formats.normalize(&representation.format, &representation.data) {
+                    LinuxFormat::Text(text) => {
+                        contents.push(ClipboardContent::Text(text.to_owned()));
+                        continue;
+                    }
+                    LinuxFormat::Duplicate => continue,
+                    LinuxFormat::Preserve => {}
+                }
+                #[cfg(target_os = "macos")]
+                let format = {
+                    let Some(format) = native_formats.normalize(&representation.format) else {
+                        continue;
+                    };
+                    format
+                };
+                #[cfg(not(target_os = "macos"))]
+                let format = representation.format.clone();
+                contents.push(ClipboardContent::Other(format, representation.data.clone()));
             }
         }
         if contents.is_empty() {
@@ -258,14 +304,13 @@ impl NativeClipboard {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-#[async_trait]
 impl ClipboardBackend for NativeClipboard {
-    async fn capture(&self) -> Result<Option<Snapshot>> {
-        self.capture_sync()
+    fn capture(&self) -> Result<Option<Snapshot>> {
+        run_native_operation(|| self.capture_sync())
     }
 
-    async fn apply(&self, representations: &[Representation]) -> Result<Snapshot> {
-        self.apply_sync(representations)
+    fn apply(&self, representations: &[Representation]) -> Result<Snapshot> {
+        run_native_operation(|| self.apply_sync(representations))
     }
 
     fn name(&self) -> &'static str {
@@ -279,7 +324,7 @@ impl ClipboardBackend for NativeClipboard {
         };
     }
 
-    fn change_receiver(&self, interval: Duration) -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
+    fn change_receiver(&self, interval: Duration) -> Option<ChangeReceiver> {
         #[cfg(target_os = "linux")]
         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
             // clipboard-rs' current Wayland watcher compares text and MIME names,
@@ -287,15 +332,34 @@ impl ClipboardBackend for NativeClipboard {
             // snapshot polling below is required for correctness on Wayland.
             return None;
         }
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mut watcher = ClipboardWatcherContext::new_with_interval(interval).ok()?;
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let mut watcher =
+            run_native_operation(|| ClipboardWatcherContext::new_with_interval(interval)).ok()?;
         watcher.add_handler(ChangeHandler(sender));
-        std::thread::Builder::new()
+        let shutdown = watcher.get_shutdown_channel();
+        let thread = std::thread::Builder::new()
             .name("ssh-clipboard-watcher".into())
             .spawn(move || watcher.start_watch())
             .ok()?;
-        Some(receiver)
+        Some(ChangeReceiver {
+            receiver,
+            _shutdown: Some(shutdown),
+            _thread: Some(thread),
+        })
     }
+}
+
+#[cfg(target_os = "macos")]
+fn run_native_operation<T, F>(operation: F) -> T
+where
+    F: objc2::rc::AutoreleaseSafe + FnOnce() -> T,
+{
+    objc2::rc::autoreleasepool(|_| operation())
+}
+
+#[cfg(target_os = "linux")]
+fn run_native_operation<T>(operation: impl FnOnce() -> T) -> T {
+    operation()
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -369,6 +433,109 @@ fn is_image_format(format: &str) -> bool {
     )
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn is_linux_plain_text_format(format: &str) -> bool {
+    matches!(
+        format,
+        "UTF8_STRING" | "public.utf8-plain-text" | "public.plain-text" | "NSStringPboardType"
+    ) || format.eq_ignore_ascii_case("text/plain")
+        || format.eq_ignore_ascii_case("text/plain;charset=utf-8")
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_plain_text<'a>(format: &str, data: &'a [u8]) -> Option<&'a str> {
+    is_linux_plain_text_format(format)
+        .then(|| std::str::from_utf8(data).ok())
+        .flatten()
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Default)]
+struct LinuxFormats {
+    added_text: bool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum LinuxFormat<'a> {
+    Text(&'a str),
+    Preserve,
+    Duplicate,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl LinuxFormats {
+    fn normalize<'a>(&mut self, format: &str, data: &'a [u8]) -> LinuxFormat<'a> {
+        let Some(text) = linux_plain_text(format, data) else {
+            return LinuxFormat::Preserve;
+        };
+        if self.added_text {
+            LinuxFormat::Duplicate
+        } else {
+            self.added_text = true;
+            LinuxFormat::Text(text)
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct MacosFormats {
+    added: HashSet<String>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl MacosFormats {
+    fn normalize(&mut self, format: &str) -> Option<String> {
+        let format = macos_clipboard_format(format)?.to_owned();
+        self.added.insert(format.clone()).then_some(format)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_clipboard_format(format: &str) -> Option<&str> {
+    if format.eq_ignore_ascii_case("text/plain;charset=utf-8") {
+        return Some("public.utf8-plain-text");
+    }
+    let mapped = match format {
+        "UTF8_STRING" | "text/plain" | "public.plain-text" | "NSStringPboardType" => "public.utf8-plain-text",
+        "text/html" => "public.html",
+        "text/rtf" | "application/rtf" => "public.rtf",
+        "image/png" => "public.png",
+        "image/jpeg" | "image/jpg" => "public.jpeg",
+        "image/tiff" => "public.tiff",
+        "image/gif" => "com.compuserve.gif",
+        "image/heic" => "public.heic",
+        "image/heif" => "public.heif",
+        "image/webp" => "org.webmproject.webp",
+        "application/pdf" => "com.adobe.pdf",
+        _ if is_valid_macos_uti(format) => format,
+        _ => return None,
+    };
+    Some(mapped)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn is_valid_macos_uti(format: &str) -> bool {
+    let mut labels = format.split('.');
+    let Some(first) = labels.next() else {
+        return false;
+    };
+    let Some(second) = labels.next() else {
+        return false;
+    };
+    valid_uti_label(first) && valid_uti_label(second) && labels.all(valid_uti_label)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn valid_uti_label(label: &str) -> bool {
+    label.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+        && label.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
 fn is_permission_denied(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
@@ -429,30 +596,28 @@ fn add_portable_aliases(representations: &mut Vec<Representation>, mut remaining
 
 #[cfg(test)]
 pub mod test_support {
-    use tokio::sync::Mutex as AsyncMutex;
-
     use super::*;
 
     #[derive(Default)]
     pub struct MockClipboard {
-        snapshot: AsyncMutex<Option<Snapshot>>,
+        snapshot: Mutex<Option<Snapshot>>,
     }
 
-    impl MockClipboard {
-        pub async fn replace(&self, representations: Vec<Representation>) {
-            *self.snapshot.lock().await = Some(Snapshot::new(representations));
-        }
-    }
-
-    #[async_trait]
     impl ClipboardBackend for MockClipboard {
-        async fn capture(&self) -> Result<Option<Snapshot>> {
-            Ok(self.snapshot.lock().await.clone())
+        fn capture(&self) -> Result<Option<Snapshot>> {
+            Ok(self
+                .snapshot
+                .lock()
+                .map_err(|_| anyhow::anyhow!("mock clipboard lock poisoned"))?
+                .clone())
         }
 
-        async fn apply(&self, representations: &[Representation]) -> Result<Snapshot> {
+        fn apply(&self, representations: &[Representation]) -> Result<Snapshot> {
             let snapshot = Snapshot::new(representations.to_vec());
-            *self.snapshot.lock().await = Some(snapshot.clone());
+            *self
+                .snapshot
+                .lock()
+                .map_err(|_| anyhow::anyhow!("mock clipboard lock poisoned"))? = Some(snapshot.clone());
             Ok(snapshot)
         }
 
@@ -540,5 +705,143 @@ mod tests {
             data: b"same".to_vec(),
         }]);
         assert_ne!(first.fingerprint, second.fingerprint);
+    }
+
+    #[test]
+    fn macos_normalizes_portable_formats_to_native_types() {
+        for (portable, native) in [
+            ("UTF8_STRING", "public.utf8-plain-text"),
+            ("text/plain;charset=utf-8", "public.utf8-plain-text"),
+            ("text/plain;charset=UTF-8", "public.utf8-plain-text"),
+            ("public.plain-text", "public.utf8-plain-text"),
+            ("NSStringPboardType", "public.utf8-plain-text"),
+            ("text/html", "public.html"),
+            ("text/rtf", "public.rtf"),
+            ("image/png", "public.png"),
+            ("image/jpeg", "public.jpeg"),
+            ("image/tiff", "public.tiff"),
+            ("image/gif", "com.compuserve.gif"),
+            ("image/heic", "public.heic"),
+            ("image/heif", "public.heif"),
+            ("image/webp", "org.webmproject.webp"),
+            ("application/pdf", "com.adobe.pdf"),
+        ] {
+            assert_eq!(macos_clipboard_format(portable), Some(native));
+        }
+        assert_eq!(
+            macos_clipboard_format("public.utf8-plain-text"),
+            Some("public.utf8-plain-text")
+        );
+        assert_eq!(
+            macos_clipboard_format("com.example.custom"),
+            Some("com.example.custom")
+        );
+        for unsupported in [
+            "STRING",
+            "TEXT",
+            "COMPOUND_TEXT",
+            "application/x-custom",
+            "x-special/gnome-copied-files",
+            "foo",
+            "com..example",
+            "com.example_thing",
+        ] {
+            assert_eq!(macos_clipboard_format(unsupported), None);
+        }
+    }
+
+    #[test]
+    fn macos_collapses_equivalent_formats_before_native_apply() {
+        let mut formats = MacosFormats::default();
+
+        assert_eq!(
+            formats.normalize("UTF8_STRING"),
+            Some("public.utf8-plain-text".to_owned())
+        );
+        assert_eq!(formats.normalize("text/plain"), None);
+        assert_eq!(formats.normalize("text/plain;charset=UTF-8"), None);
+        assert_eq!(formats.normalize("public.utf8-plain-text"), None);
+        assert_eq!(formats.normalize("STRING"), None);
+        assert_eq!(
+            formats.normalize("com.example.custom"),
+            Some("com.example.custom".to_owned())
+        );
+    }
+
+    #[test]
+    fn linux_recognizes_native_and_portable_plain_text_formats() {
+        for format in [
+            "UTF8_STRING",
+            "text/plain",
+            "text/plain;charset=utf-8",
+            "text/plain;charset=UTF-8",
+            "public.utf8-plain-text",
+            "public.plain-text",
+            "NSStringPboardType",
+        ] {
+            assert!(is_linux_plain_text_format(format));
+        }
+        for format in [
+            "STRING",
+            "TEXT",
+            "COMPOUND_TEXT",
+            "text/html",
+            "public.html",
+            "com.example.custom",
+        ] {
+            assert!(!is_linux_plain_text_format(format));
+        }
+    }
+
+    #[test]
+    fn linux_plain_text_requires_valid_utf8() {
+        assert_eq!(
+            linux_plain_text("public.utf8-plain-text", "clipboard 東京".as_bytes()),
+            Some("clipboard 東京")
+        );
+        assert_eq!(linux_plain_text("public.utf8-plain-text", &[0xff, 0xfe]), None);
+        assert_eq!(linux_plain_text("com.example.custom", b"clipboard"), None);
+    }
+
+    #[test]
+    fn linux_collapses_equivalent_text_and_preserves_other_bytes() {
+        let mut formats = LinuxFormats::default();
+
+        assert_eq!(
+            formats.normalize("public.utf8-plain-text", b"clipboard"),
+            LinuxFormat::Text("clipboard")
+        );
+        assert_eq!(
+            formats.normalize("text/plain;charset=utf-8", b"clipboard"),
+            LinuxFormat::Duplicate
+        );
+        assert_eq!(
+            formats.normalize("public.utf8-plain-text", &[0xff]),
+            LinuxFormat::Preserve
+        );
+        assert_eq!(
+            formats.normalize("com.example.custom", b"clipboard"),
+            LinuxFormat::Preserve
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn watcher_notifications_are_coalesced_while_capture_is_busy() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let mut handler = ChangeHandler(sender);
+
+        for _ in 0..10_000 {
+            handler.on_clipboard_change();
+        }
+
+        assert_eq!(receiver.try_recv(), Ok(()));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        handler.on_clipboard_change();
+        assert_eq!(receiver.try_recv(), Ok(()));
     }
 }

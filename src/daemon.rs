@@ -14,13 +14,43 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::clipboard::{ClipboardBackend, NativeClipboard};
+use crate::clipboard::{ChangeReceiver, ClipboardBackend, NativeClipboard, Snapshot};
 use crate::config::{Config, PeerConfig, detected_machine_name, ensure_private_dir, paths};
 use crate::filebundle;
 use crate::model::{Clip, Direction, MonitorEvent};
 use crate::protocol::{Message, read_message, write_clip, write_message};
 use crate::ssh;
 use crate::update::{self, CURRENT_VERSION};
+
+const WATCHER_RECONCILE_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const WATCHER_RECONCILE_MAX_DELAY: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy)]
+struct WatcherReconcile {
+    deadline: tokio::time::Instant,
+    delay: Duration,
+}
+
+impl WatcherReconcile {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            deadline: now + WATCHER_RECONCILE_INITIAL_DELAY,
+            delay: WATCHER_RECONCILE_INITIAL_DELAY,
+        }
+    }
+
+    fn retry(&mut self, now: tokio::time::Instant) {
+        self.delay = self.delay.saturating_mul(2).min(WATCHER_RECONCILE_MAX_DELAY);
+        self.deadline = now + self.delay;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipboardWake {
+    Native,
+    Reconcile,
+    Poll,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerStatus {
@@ -77,7 +107,8 @@ struct Daemon {
     clipboard: Arc<dyn ClipboardBackend>,
     peers: RwLock<HashMap<Uuid, PeerLink>>,
     seen: Mutex<HashMap<Uuid, Instant>>,
-    suppressed: Mutex<HashMap<[u8; 32], usize>>,
+    suppressed: Mutex<Option<[u8; 32]>>,
+    last_clipboard: Mutex<Option<[u8; 32]>>,
     apply_lock: Mutex<()>,
     events: broadcast::Sender<MonitorEvent>,
     desired_version: watch::Sender<String>,
@@ -105,7 +136,8 @@ impl Daemon {
             clipboard,
             peers: RwLock::new(HashMap::new()),
             seen: Mutex::new(HashMap::new()),
-            suppressed: Mutex::new(HashMap::new()),
+            suppressed: Mutex::new(None),
+            last_clipboard: Mutex::new(None),
             apply_lock: Mutex::new(()),
             events,
             desired_version,
@@ -114,16 +146,30 @@ impl Daemon {
     }
 
     async fn watch_clipboard(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
-        let mut previous = self.clipboard.capture().await.ok().flatten();
         let poll = Duration::from_millis(self.config.poll_interval_ms);
         let mut changes = self.clipboard.change_receiver(poll);
-        let mut interval = tokio::time::interval(Duration::from_millis(self.config.poll_interval_ms));
+        let mut interval = tokio::time::interval(poll);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        {
+            let _guard = self.apply_lock.lock().await;
+            let initial = self.capture_clipboard().await.ok().flatten();
+            *self.last_clipboard.lock().await = initial.map(|snapshot| snapshot.fingerprint);
+        }
+        interval.reset();
+        let mut watcher_reconcile = changes
+            .as_ref()
+            .map(|_| WatcherReconcile::new(tokio::time::Instant::now()));
         loop {
             tokio::select! {
-                () = next_clipboard_change(&mut changes, &mut interval) => {
+                wake = next_clipboard_change(&mut changes, &mut interval, &mut watcher_reconcile) => {
                     let _guard = self.apply_lock.lock().await;
-                    let snapshot = match self.clipboard.capture().await {
+                    let snapshot = self.capture_clipboard().await;
+                    if wake == ClipboardWake::Reconcile
+                        && let Some(reconcile) = &mut watcher_reconcile
+                    {
+                        reconcile.retry(tokio::time::Instant::now());
+                    }
+                    let snapshot = match snapshot {
                         Ok(Some(snapshot)) => snapshot,
                         Ok(None) => continue,
                         Err(error) => {
@@ -131,19 +177,12 @@ impl Daemon {
                             continue;
                         }
                     };
-                    if previous.as_ref().is_some_and(|last| last.fingerprint == snapshot.fingerprint) {
+                    if !self.record_clipboard_fingerprint(snapshot.fingerprint).await {
                         continue;
                     }
-                    previous = Some(snapshot.clone());
-                    let mut suppressed = self.suppressed.lock().await;
-                    if let Some(count) = suppressed.get_mut(&snapshot.fingerprint) {
-                        *count -= 1;
-                        if *count == 0 {
-                            suppressed.remove(&snapshot.fingerprint);
-                        }
+                    if self.take_suppressed(snapshot.fingerprint).await {
                         continue;
                     }
-                    drop(suppressed);
                     let clip = Arc::new(Clip::new(self.config.node_id, snapshot.representations));
                     self.mark_seen(clip.id).await;
                     self.emit(Direction::Local, None, &clip);
@@ -217,59 +256,96 @@ impl Daemon {
             established.store(true, Ordering::Release);
         }
 
-        let result = loop {
-            tokio::select! {
-                incoming = read_message(reader, self.config.max_bytes) => {
-                    match incoming {
-                        Ok(Message::Clip(clip)) => self.receive_clip(Arc::new(clip), &node_name, connection_id).await,
-                        Ok(Message::Hello { .. }) => {
-                            break Err(anyhow::anyhow!("peer sent a second hello"));
-                        }
-                        Ok(Message::UpdateAvailable { version, .. }) => {
-                            if let Some(peer) = self.peers.write().await.get_mut(&connection_id) {
-                                peer.desired_version = Some(version.clone());
-                            }
-                            if update::newer_version(CURRENT_VERSION, &version) {
-                                let _ = self.update_hints.send(version);
-                            }
-                        }
-                        Err(error) => break Err(error.into()),
-                    }
+        let (read_stop, mut read_stop_rx) = watch::channel(false);
+        let read_loop = async {
+            loop {
+                if *read_stop_rx.borrow() {
+                    break Ok(());
                 }
-                changed = receiver.changed() => {
-                    if changed.is_err() {
-                        break Ok(());
+                let incoming = tokio::select! {
+                    biased;
+                    changed = read_stop_rx.changed() => {
+                        if changed.is_err() || *read_stop_rx.borrow() {
+                            break Ok(());
+                        }
+                        continue;
                     }
-                    let clip = receiver.borrow_and_update().clone();
-                    if let Some(clip) = clip {
-                        if let Err(error) = write_clip(writer, &clip, self.config.max_bytes).await {
+                    incoming = read_message(reader, self.config.max_bytes) => incoming,
+                };
+                match incoming {
+                    Ok(Message::Clip(clip)) => {
+                        self.receive_clip(Arc::new(clip), &node_name, connection_id).await;
+                    }
+                    Ok(Message::Hello { .. }) => {
+                        break Err(anyhow::anyhow!("peer sent a second hello"));
+                    }
+                    Ok(Message::UpdateAvailable { version, .. }) => {
+                        if let Some(peer) = self.peers.write().await.get_mut(&connection_id) {
+                            peer.desired_version = Some(version.clone());
+                        }
+                        if update::newer_version(CURRENT_VERSION, &version) {
+                            let _ = self.update_hints.send(version);
+                        }
+                    }
+                    Err(error) => break Err(error.into()),
+                }
+            }
+        };
+        let write_loop = async {
+            loop {
+                tokio::select! {
+                    changed = receiver.changed() => {
+                        if changed.is_err() {
+                            break Ok(());
+                        }
+                        let clip = receiver.borrow_and_update().clone();
+                        if let Some(clip) = clip {
+                            if let Err(error) = write_clip(writer, &clip, self.config.max_bytes).await {
+                                break Err(error.into());
+                            }
+                            self.emit(Direction::Send, Some(node_name.clone()), &clip);
+                        }
+                    }
+                    changed = desired_updates.changed(), if app_version.is_some() => {
+                        if changed.is_err() {
+                            break Ok(());
+                        }
+                        let version = desired_updates.borrow_and_update().clone();
+                        if let Err(error) = write_message(
+                            writer,
+                            &Message::UpdateAvailable {
+                                update_id: Uuid::new_v4(),
+                                version,
+                            },
+                            self.config.max_bytes,
+                        ).await {
                             break Err(error.into());
                         }
-                        self.emit(Direction::Send, Some(node_name.clone()), &clip);
-                    }
-                }
-                changed = desired_updates.changed(), if app_version.is_some() => {
-                    if changed.is_err() {
-                        break Ok(());
-                    }
-                    let version = desired_updates.borrow_and_update().clone();
-                    if let Err(error) = write_message(
-                        writer,
-                        &Message::UpdateAvailable {
-                            update_id: Uuid::new_v4(),
-                            version,
-                        },
-                        self.config.max_bytes,
-                    ).await {
-                        break Err(error.into());
-                    }
-                }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        break Ok(());
                     }
                 }
             }
+        };
+        let shutdown_loop = async {
+            loop {
+                if *shutdown.borrow() || shutdown.changed().await.is_err() {
+                    break;
+                }
+            }
+        };
+        tokio::pin!(read_loop);
+        tokio::pin!(write_loop);
+        tokio::pin!(shutdown_loop);
+        let result = tokio::select! {
+            result = &mut read_loop => result,
+            result = &mut write_loop => {
+                read_stop.send_replace(true);
+                result.and(read_loop.await)
+            },
+            () = &mut shutdown_loop => {
+                read_stop.send_replace(true);
+                let _ = read_loop.await;
+                Ok(())
+            },
         };
         self.peers.write().await.remove(&connection_id);
         info!(peer = %node_name, "peer disconnected");
@@ -283,24 +359,31 @@ impl Daemon {
         self.emit(Direction::Receive, Some(peer_name.to_owned()), &clip);
         self.broadcast_clip(Arc::clone(&clip), Some(source)).await;
         let _guard = self.apply_lock.lock().await;
-        let representations = match filebundle::materialize(clip.id, &clip.representations) {
-            Ok(representations) => representations,
-            Err(error) => {
-                warn!(%error, peer = %peer_name, clip = %clip.id, "failed to materialize copied files");
-                return;
-            }
-        };
-        match self.clipboard.apply(&representations).await {
+        match self.apply_clipboard(Arc::clone(&clip)).await {
             Ok(snapshot) => {
-                *self
-                    .suppressed
-                    .lock()
-                    .await
-                    .entry(snapshot.fingerprint)
-                    .or_default() += 1;
+                *self.last_clipboard.lock().await = Some(snapshot.fingerprint);
+                *self.suppressed.lock().await = Some(snapshot.fingerprint);
             }
             Err(error) => warn!(%error, peer = %peer_name, clip = %clip.id, "failed to apply clipboard"),
         }
+    }
+
+    async fn capture_clipboard(&self) -> Result<Option<Snapshot>> {
+        let clipboard = Arc::clone(&self.clipboard);
+        tokio::task::spawn_blocking(move || clipboard.capture())
+            .await
+            .context("clipboard capture worker stopped")?
+    }
+
+    async fn apply_clipboard(&self, clip: Arc<Clip>) -> Result<Snapshot> {
+        let clipboard = Arc::clone(&self.clipboard);
+        tokio::task::spawn_blocking(move || {
+            let representations = filebundle::materialize(clip.id, &clip.representations)
+                .context("materialize copied files")?;
+            clipboard.apply(&representations)
+        })
+        .await
+        .context("clipboard apply worker stopped")?
     }
 
     async fn broadcast_clip(&self, clip: Arc<Clip>, except: Option<Uuid>) {
@@ -324,6 +407,19 @@ impl Daemon {
                 .unwrap_or_else(Instant::now);
             seen.retain(|_, instant| *instant >= cutoff);
         }
+        true
+    }
+
+    async fn take_suppressed(&self, fingerprint: [u8; 32]) -> bool {
+        self.suppressed.lock().await.take() == Some(fingerprint)
+    }
+
+    async fn record_clipboard_fingerprint(&self, fingerprint: [u8; 32]) -> bool {
+        let mut last = self.last_clipboard.lock().await;
+        if *last == Some(fingerprint) {
+            return false;
+        }
+        *last = Some(fingerprint);
         true
     }
 
@@ -388,16 +484,31 @@ impl Daemon {
 }
 
 async fn next_clipboard_change(
-    changes: &mut Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    changes: &mut Option<ChangeReceiver>,
     interval: &mut tokio::time::Interval,
-) {
+    watcher_reconcile: &mut Option<WatcherReconcile>,
+) -> ClipboardWake {
     if let Some(receiver) = changes {
-        if receiver.recv().await.is_some() {
-            return;
+        let change = if let Some(reconcile) = watcher_reconcile.as_ref() {
+            tokio::select! {
+                change = receiver.recv() => change,
+                () = tokio::time::sleep_until(reconcile.deadline) => {
+                    return ClipboardWake::Reconcile;
+                }
+            }
+        } else {
+            receiver.recv().await
+        };
+        if change.is_some() {
+            *watcher_reconcile = None;
+            return ClipboardWake::Native;
         }
         *changes = None;
+        *watcher_reconcile = None;
+        interval.reset();
     }
     interval.tick().await;
+    ClipboardWake::Poll
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -676,12 +787,256 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::sync::{Condvar, Mutex as StdMutex};
+    use std::task::{Context as TaskContext, Poll};
+
     use tokio::io::{duplex, split};
+    use tokio::sync::{Barrier, oneshot};
     use tokio::time::timeout;
 
     use super::*;
     use crate::clipboard::test_support::MockClipboard;
     use crate::model::Representation;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum BlockingOperation {
+        Capture,
+        Apply,
+    }
+
+    struct BlockingClipboard {
+        operation: BlockingOperation,
+        started: StdMutex<Option<oneshot::Sender<()>>>,
+        released: StdMutex<bool>,
+        gate: Condvar,
+    }
+
+    struct InitialCaptureClipboard {
+        capture_started: StdMutex<Option<oneshot::Sender<()>>>,
+        apply_started: StdMutex<Option<oneshot::Sender<()>>>,
+        released: StdMutex<bool>,
+        gate: Condvar,
+    }
+
+    struct GatedWriter<W> {
+        inner: W,
+        armed: Arc<AtomicBool>,
+        gate: Arc<Barrier>,
+        waiting: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+        released: bool,
+    }
+
+    struct FailingWriter<W> {
+        inner: W,
+        armed: Arc<AtomicBool>,
+        failed: Option<oneshot::Sender<()>>,
+    }
+
+    impl<W> GatedWriter<W> {
+        fn new(inner: W, armed: Arc<AtomicBool>, gate: Arc<Barrier>) -> Self {
+            Self {
+                inner,
+                armed,
+                gate,
+                waiting: None,
+                released: false,
+            }
+        }
+    }
+
+    impl<W> FailingWriter<W> {
+        fn new(inner: W, armed: Arc<AtomicBool>, failed: oneshot::Sender<()>) -> Self {
+            Self {
+                inner,
+                armed,
+                failed: Some(failed),
+            }
+        }
+    }
+
+    impl<W> AsyncWrite for GatedWriter<W>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if this.armed.load(Ordering::Acquire) && !this.released {
+                if this.waiting.is_none() {
+                    let gate = Arc::clone(&this.gate);
+                    this.waiting = Some(Box::pin(async move {
+                        gate.wait().await;
+                    }));
+                }
+                if this
+                    .waiting
+                    .as_mut()
+                    .is_some_and(|waiting| waiting.as_mut().poll(context).is_pending())
+                {
+                    return Poll::Pending;
+                }
+                this.waiting = None;
+                this.released = true;
+            }
+            Pin::new(&mut this.inner).poll_write(context, buffer)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+        }
+    }
+
+    impl<W> AsyncWrite for FailingWriter<W>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if this.armed.load(Ordering::Acquire) {
+                if let Some(failed) = this.failed.take() {
+                    let _ = failed.send(());
+                }
+                return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+            }
+            Pin::new(&mut this.inner).poll_write(context, buffer)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+        }
+    }
+
+    impl InitialCaptureClipboard {
+        fn new() -> (Arc<Self>, oneshot::Receiver<()>, oneshot::Receiver<()>) {
+            let (capture_started, capture_receiver) = oneshot::channel();
+            let (apply_started, apply_receiver) = oneshot::channel();
+            (
+                Arc::new(Self {
+                    capture_started: StdMutex::new(Some(capture_started)),
+                    apply_started: StdMutex::new(Some(apply_started)),
+                    released: StdMutex::new(false),
+                    gate: Condvar::new(),
+                }),
+                capture_receiver,
+                apply_receiver,
+            )
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.gate.notify_all();
+        }
+    }
+
+    impl ClipboardBackend for InitialCaptureClipboard {
+        fn capture(&self) -> Result<Option<Snapshot>> {
+            if let Some(started) = self.capture_started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            let released = self.released.lock().unwrap();
+            let (released, _) = self
+                .gate
+                .wait_timeout_while(released, Duration::from_secs(2), |released| !*released)
+                .unwrap();
+            drop(released);
+            Ok(None)
+        }
+
+        fn apply(&self, representations: &[Representation]) -> Result<Snapshot> {
+            if let Some(started) = self.apply_started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            Ok(Snapshot::new(representations.to_vec()))
+        }
+
+        fn name(&self) -> &'static str {
+            "initial capture mock"
+        }
+    }
+
+    impl BlockingClipboard {
+        fn new(operation: BlockingOperation) -> (Arc<Self>, oneshot::Receiver<()>) {
+            let (started, receiver) = oneshot::channel();
+            (
+                Arc::new(Self {
+                    operation,
+                    started: StdMutex::new(Some(started)),
+                    released: StdMutex::new(false),
+                    gate: Condvar::new(),
+                }),
+                receiver,
+            )
+        }
+
+        fn block(&self, operation: BlockingOperation) {
+            if self.operation != operation {
+                return;
+            }
+            if let Some(started) = self.started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            let released = self.released.lock().unwrap();
+            let (released, _) = self
+                .gate
+                .wait_timeout_while(released, Duration::from_secs(2), |released| !*released)
+                .unwrap();
+            drop(released);
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.gate.notify_all();
+        }
+    }
+
+    impl ClipboardBackend for BlockingClipboard {
+        fn capture(&self) -> Result<Option<Snapshot>> {
+            self.block(BlockingOperation::Capture);
+            Ok(None)
+        }
+
+        fn apply(&self, representations: &[Representation]) -> Result<Snapshot> {
+            self.block(BlockingOperation::Apply);
+            Ok(Snapshot::new(representations.to_vec()))
+        }
+
+        fn name(&self) -> &'static str {
+            "blocking mock"
+        }
+    }
+
+    async fn assert_status_is_responsive(daemon: Arc<Daemon>) {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(b"STATUS\n").await.unwrap();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let request = tokio::spawn(handle_local(daemon, server, shutdown_rx));
+        let mut line = String::new();
+        timeout(
+            Duration::from_millis(250),
+            BufReader::new(client).read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(serde_json::from_str::<Status>(&line).unwrap().running);
+        request.await.unwrap().unwrap();
+    }
 
     #[test]
     fn status_from_an_older_daemon_defaults_version_fields() {
@@ -920,7 +1275,7 @@ mod tests {
         assert_eq!(relayed, Message::Clip(clip.clone()));
         let applied = timeout(Duration::from_secs(1), async {
             loop {
-                if let Some(snapshot) = clipboard.capture().await.unwrap()
+                if let Some(snapshot) = clipboard.capture().unwrap()
                     && snapshot.representations == clip.representations
                 {
                     break snapshot;
@@ -931,6 +1286,415 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(applied.representations, clip.representations);
+    }
+
+    #[tokio::test]
+    async fn simultaneous_large_peer_writes_keep_readers_active() {
+        let left_config = Config {
+            node_name: "left".into(),
+            ..Config::default()
+        };
+        let right_config = Config {
+            node_name: "right".into(),
+            ..Config::default()
+        };
+        let left_clipboard = Arc::new(MockClipboard::default());
+        let right_clipboard = Arc::new(MockClipboard::default());
+        let left_daemon = Daemon::new(left_config.clone(), left_clipboard.clone());
+        let right_daemon = Daemon::new(right_config.clone(), right_clipboard.clone());
+        let (left_stream, right_stream) = duplex(1024);
+        let (mut left_reader, left_writer) = split(left_stream);
+        let (mut right_reader, right_writer) = split(right_stream);
+        let armed = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(Barrier::new(2));
+        let mut left_writer = GatedWriter::new(left_writer, Arc::clone(&armed), Arc::clone(&gate));
+        let mut right_writer = GatedWriter::new(right_writer, Arc::clone(&armed), Arc::clone(&gate));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let left_session = {
+            let daemon = Arc::clone(&left_daemon);
+            let shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                daemon
+                    .serve_peer(&mut left_reader, &mut left_writer, "right", shutdown, None)
+                    .await
+            })
+        };
+        let right_session = {
+            let daemon = Arc::clone(&right_daemon);
+            tokio::spawn(async move {
+                daemon
+                    .serve_peer(&mut right_reader, &mut right_writer, "left", shutdown_rx, None)
+                    .await
+            })
+        };
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let left_connected = left_daemon.status().await.connected_peers == ["right"];
+                let right_connected = right_daemon.status().await.connected_peers == ["left"];
+                if left_connected && right_connected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let left_clip = Arc::new(Clip::new(
+            left_config.node_id,
+            vec![Representation {
+                item: 0,
+                format: "application/octet-stream".into(),
+                data: vec![0x11; 64 * 1024],
+            }],
+        ));
+        let right_clip = Arc::new(Clip::new(
+            right_config.node_id,
+            vec![Representation {
+                item: 0,
+                format: "application/octet-stream".into(),
+                data: vec![0x22; 64 * 1024],
+            }],
+        ));
+        let expected_left = right_clip.representations.clone();
+        let expected_right = left_clip.representations.clone();
+        armed.store(true, Ordering::Release);
+        tokio::join!(
+            left_daemon.broadcast_clip(left_clip, None),
+            right_daemon.broadcast_clip(right_clip, None)
+        );
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let left_applied = left_clipboard
+                    .capture()
+                    .unwrap()
+                    .is_some_and(|snapshot| snapshot.representations == expected_left);
+                let right_applied = right_clipboard
+                    .capture()
+                    .unwrap()
+                    .is_some_and(|snapshot| snapshot.representations == expected_right);
+                if left_applied && right_applied {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        shutdown_tx.send(true).unwrap();
+        timeout(Duration::from_secs(1), async {
+            let _ = left_session.await.unwrap();
+            let _ = right_session.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_failure_waits_for_active_clipboard_apply() {
+        let config = Config {
+            node_name: "local".into(),
+            ..Config::default()
+        };
+        let (clipboard, apply_started) = BlockingClipboard::new(BlockingOperation::Apply);
+        let daemon = Daemon::new(config.clone(), clipboard.clone());
+        let (peer, server) = duplex(16 * 1024);
+        let (mut peer_reader, mut peer_writer) = split(peer);
+        let (mut server_reader, server_writer) = split(server);
+        let armed = Arc::new(AtomicBool::new(false));
+        let (failed_tx, failed_rx) = oneshot::channel();
+        let mut server_writer = FailingWriter::new(server_writer, Arc::clone(&armed), failed_tx);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let serving_daemon = Arc::clone(&daemon);
+        let mut session = tokio::spawn(async move {
+            serving_daemon
+                .serve_peer(
+                    &mut server_reader,
+                    &mut server_writer,
+                    "remote",
+                    shutdown_rx,
+                    None,
+                )
+                .await
+        });
+        assert!(matches!(
+            read_message(&mut peer_reader, config.max_bytes).await.unwrap(),
+            Message::Hello { .. }
+        ));
+        write_message(
+            &mut peer_writer,
+            &Message::Hello {
+                node_id: Uuid::new_v4(),
+                node_name: "remote".into(),
+                machine_name: Some("remote.local".into()),
+                app_version: Some(CURRENT_VERSION.into()),
+                desired_version: Some(CURRENT_VERSION.into()),
+            },
+            config.max_bytes,
+        )
+        .await
+        .unwrap();
+        let remote_clip = Clip::new(
+            Uuid::new_v4(),
+            vec![Representation {
+                item: 0,
+                format: "text/plain".into(),
+                data: b"remote".to_vec(),
+            }],
+        );
+        let expected = Snapshot::new(remote_clip.representations.clone()).fingerprint;
+        write_clip(&mut peer_writer, &remote_clip, config.max_bytes)
+            .await
+            .unwrap();
+        timeout(Duration::from_millis(500), apply_started)
+            .await
+            .unwrap()
+            .unwrap();
+
+        armed.store(true, Ordering::Release);
+        daemon
+            .broadcast_clip(
+                Arc::new(Clip::new(
+                    config.node_id,
+                    vec![Representation {
+                        item: 0,
+                        format: "text/plain".into(),
+                        data: b"local".to_vec(),
+                    }],
+                )),
+                None,
+            )
+            .await;
+        timeout(Duration::from_millis(500), failed_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(timeout(Duration::from_millis(100), &mut session).await.is_err());
+        assert!(daemon.apply_lock.try_lock().is_err());
+        assert_eq!(*daemon.last_clipboard.lock().await, None);
+        assert_eq!(*daemon.suppressed.lock().await, None);
+
+        clipboard.release();
+        let result = timeout(Duration::from_millis(500), &mut session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        assert_eq!(*daemon.last_clipboard.lock().await, Some(expected));
+        assert_eq!(*daemon.suppressed.lock().await, Some(expected));
+        assert!(daemon.apply_lock.try_lock().is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_capture_keeps_local_commands_responsive() {
+        let (clipboard, started) = BlockingClipboard::new(BlockingOperation::Capture);
+        let daemon = Daemon::new(Config::default(), clipboard.clone());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let watcher = tokio::spawn(Arc::clone(&daemon).watch_clipboard(shutdown_rx));
+        let wait_started = Instant::now();
+
+        timeout(Duration::from_millis(500), started)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(wait_started.elapsed() < Duration::from_millis(500));
+        assert_status_is_responsive(daemon).await;
+
+        clipboard.release();
+        shutdown_tx.send(true).unwrap();
+        watcher.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn initial_capture_is_serialized_with_remote_apply() {
+        let (clipboard, capture_started, apply_started) = InitialCaptureClipboard::new();
+        let daemon = Daemon::new(Config::default(), clipboard.clone());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let watcher = tokio::spawn(Arc::clone(&daemon).watch_clipboard(shutdown_rx));
+        timeout(Duration::from_millis(500), capture_started)
+            .await
+            .unwrap()
+            .unwrap();
+        let applying_daemon = Arc::clone(&daemon);
+        let applying = tokio::spawn(async move {
+            applying_daemon
+                .receive_clip(
+                    Arc::new(Clip::new(
+                        Uuid::new_v4(),
+                        vec![Representation {
+                            item: 0,
+                            format: "text/plain".into(),
+                            data: b"remote".to_vec(),
+                        }],
+                    )),
+                    "remote",
+                    Uuid::new_v4(),
+                )
+                .await;
+        });
+        let mut apply_started = Box::pin(apply_started);
+
+        assert!(
+            timeout(Duration::from_millis(100), &mut apply_started)
+                .await
+                .is_err()
+        );
+        clipboard.release();
+        timeout(Duration::from_millis(500), &mut apply_started)
+            .await
+            .unwrap()
+            .unwrap();
+
+        applying.await.unwrap();
+        shutdown_tx.send(true).unwrap();
+        watcher.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_apply_keeps_local_commands_responsive() {
+        let (clipboard, started) = BlockingClipboard::new(BlockingOperation::Apply);
+        let daemon = Daemon::new(Config::default(), clipboard.clone());
+        let clip = Arc::new(Clip::new(
+            Uuid::new_v4(),
+            vec![Representation {
+                item: 0,
+                format: "text/plain".into(),
+                data: b"responsive".to_vec(),
+            }],
+        ));
+        let applying_daemon = Arc::clone(&daemon);
+        let applying = tokio::spawn(async move {
+            applying_daemon.receive_clip(clip, "remote", Uuid::new_v4()).await;
+        });
+        let wait_started = Instant::now();
+
+        timeout(Duration::from_millis(500), started)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(wait_started.elapsed() < Duration::from_millis(500));
+        assert_status_is_responsive(daemon).await;
+
+        clipboard.release();
+        applying.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_the_latest_remote_fingerprint_is_suppressed() {
+        let clipboard = Arc::new(MockClipboard::default());
+        let daemon = Daemon::new(Config::default(), clipboard);
+        let first = Arc::new(Clip::new(
+            Uuid::new_v4(),
+            vec![Representation {
+                item: 0,
+                format: "text/plain".into(),
+                data: b"first".to_vec(),
+            }],
+        ));
+        let second = Arc::new(Clip::new(
+            Uuid::new_v4(),
+            vec![Representation {
+                item: 0,
+                format: "text/plain".into(),
+                data: b"second".to_vec(),
+            }],
+        ));
+        let first_fingerprint = Snapshot::new(first.representations.clone()).fingerprint;
+        let second_fingerprint = Snapshot::new(second.representations.clone()).fingerprint;
+
+        daemon.receive_clip(first, "remote", Uuid::new_v4()).await;
+        daemon.receive_clip(second, "remote", Uuid::new_v4()).await;
+
+        assert!(daemon.take_suppressed(second_fingerprint).await);
+        assert!(!daemon.take_suppressed(first_fingerprint).await);
+    }
+
+    #[tokio::test]
+    async fn remote_apply_refreshes_the_local_change_baseline() {
+        let clipboard = Arc::new(MockClipboard::default());
+        let daemon = Daemon::new(Config::default(), clipboard);
+        let local = Snapshot::new(vec![Representation {
+            item: 0,
+            format: "text/plain".into(),
+            data: b"local".to_vec(),
+        }]);
+        let remote = Arc::new(Clip::new(
+            Uuid::new_v4(),
+            vec![Representation {
+                item: 0,
+                format: "text/plain".into(),
+                data: b"remote".to_vec(),
+            }],
+        ));
+        *daemon.last_clipboard.lock().await = Some(local.fingerprint);
+
+        daemon.receive_clip(remote, "remote", Uuid::new_v4()).await;
+
+        assert!(daemon.record_clipboard_fingerprint(local.fingerprint).await);
+    }
+
+    #[test]
+    fn watcher_reconciliation_retries_with_bounded_backoff() {
+        let mut now = tokio::time::Instant::now();
+        let mut reconcile = WatcherReconcile::new(now);
+        assert_eq!(reconcile.deadline.duration_since(now), Duration::from_secs(1));
+
+        for expected in [2, 4, 8, 16, 30, 30] {
+            now = reconcile.deadline;
+            reconcile.retry(now);
+            assert_eq!(reconcile.delay, Duration::from_secs(expected));
+            assert_eq!(
+                reconcile.deadline.duration_since(now),
+                Duration::from_secs(expected)
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watcher_reconciliation_continues_until_native_event() {
+        let (sender, receiver) = mpsc::channel(1);
+        let mut changes = Some(ChangeReceiver::for_test(receiver));
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let mut reconcile = Some(WatcherReconcile::new(tokio::time::Instant::now()));
+
+        assert_eq!(
+            next_clipboard_change(&mut changes, &mut interval, &mut reconcile).await,
+            ClipboardWake::Reconcile
+        );
+        tokio::time::advance(Duration::from_secs(5)).await;
+        reconcile.as_mut().unwrap().retry(tokio::time::Instant::now());
+        assert_eq!(
+            reconcile
+                .as_ref()
+                .unwrap()
+                .deadline
+                .duration_since(tokio::time::Instant::now()),
+            Duration::from_secs(2)
+        );
+
+        assert_eq!(
+            next_clipboard_change(&mut changes, &mut interval, &mut reconcile).await,
+            ClipboardWake::Reconcile
+        );
+        reconcile.as_mut().unwrap().retry(tokio::time::Instant::now());
+        sender.try_send(()).unwrap();
+        assert_eq!(
+            next_clipboard_change(&mut changes, &mut interval, &mut reconcile).await,
+            ClipboardWake::Native
+        );
+        assert!(reconcile.is_none());
+        assert!(
+            timeout(
+                Duration::from_secs(31),
+                next_clipboard_change(&mut changes, &mut interval, &mut reconcile)
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[test]

@@ -158,6 +158,28 @@ mod tests {
     }
 
     #[test]
+    fn normalized_x11_text_is_readable_as_native_text() {
+        objc2::rc::autoreleasepool(|_| {
+            let text = "ssh-clipboard x11 text 東京";
+            let format = super::super::macos_clipboard_format("UTF8_STRING").unwrap();
+            let item = NSPasteboardItem::new();
+            set_data(&item, format, text.as_bytes()).unwrap();
+            let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+            pasteboard.clearContents();
+            let objects = NSArray::from_retained_slice(&[ProtocolObject::from_retained(item)]);
+            assert!(pasteboard.writeObjects(&objects));
+
+            let item = pasteboard.pasteboardItems().unwrap().iter().next().unwrap();
+            assert_eq!(
+                item.stringForType(&NSString::from_str("public.utf8-plain-text"))
+                    .unwrap()
+                    .to_string(),
+                text
+            );
+        });
+    }
+
+    #[test]
     fn recognizes_common_image_file_signatures() {
         assert_eq!(
             detect_image_format(Path::new("attachment"), b"\xff\xd8\xffbody"),
