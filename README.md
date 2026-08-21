@@ -47,3 +47,7 @@ Every installed daemon independently checks the stable npm release at startup an
 macOS and Linux · arm64 and x64 · Rust + [Ratatui](https://ratatui.rs)
 
 <sub>Deep cuts: [architecture](docs/architecture.md) · [TUI design](docs/tui-design.md) · [npm distribution](docs/distribution.md)</sub>
+
+## Attribution
+
+Created by [Justin Schroeder](https://github.com/justin-schroeder) and maintained by [Standard Agents](https://github.com/standardagents). Released under the [MIT License](LICENSE).
