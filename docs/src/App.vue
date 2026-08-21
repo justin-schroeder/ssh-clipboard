@@ -37,7 +37,7 @@ onBeforeUnmount(() => observer?.disconnect())
 const features = [
   {
     name: 'native',
-    text: 'macOS pasteboard plus Linux Wayland and X11 — real system clipboards, not terminal escape tricks.',
+    text: 'Writes the real system clipboard: the macOS pasteboard, and Wayland or X11 on Linux.',
   },
   {
     name: 'private',
@@ -45,19 +45,19 @@ const features = [
   },
   {
     name: 'faithful',
-    text: 'Preserves every available clipboard representation — rich text, images, files — not just text or PNG.',
+    text: 'Preserves every available clipboard representation: rich text, images, and files.',
   },
   {
     name: 'invisible',
-    text: 'Raycast and other clipboard managers see ordinary system clipboard writes. Nothing to configure.',
+    text: 'Raycast and other clipboard managers see ordinary system clipboard writes. There is nothing to configure.',
   },
   {
     name: 'fast',
-    text: 'Raw bytes over persistent connections, with deduplication and newest-value queues.',
+    text: 'Sends raw bytes over persistent connections, with deduplication and newest-value queues.',
   },
   {
     name: 'self-updating',
-    text: 'Daemons gossip verified versions peer-to-peer and converge on the latest stable release — no coordinator.',
+    text: 'Daemons gossip verified versions peer to peer and converge on the latest stable release without a central coordinator.',
   },
 ]
 
@@ -93,9 +93,7 @@ const docLink =
 </script>
 
 <template>
-  <header
-    class="sticky top-0 z-10 border-b border-line bg-bg/80 backdrop-blur-[10px]"
-  >
+  <header class="sticky top-0 z-10 border-b border-line bg-bg">
     <div class="flex w-full items-center justify-between gap-4 px-6 py-3 max-md:px-4 max-md:py-2.5">
       <a class="whitespace-nowrap font-semibold text-bright" href="#top">
         ssh-clipboard<span class="text-mint animate-[blink_1.2s_steps(1,end)_infinite]">_</span>
@@ -113,50 +111,35 @@ const docLink =
     <!-- ── hero ─────────────────────────────── -->
     <section class="relative px-5 pb-10 pt-14 text-left max-xl:text-center max-md:pt-10">
       <div
-        class="pointer-events-none absolute -inset-x-96 -top-32 h-[34rem] blur-[10px] [background:radial-gradient(38rem_20rem_at_38%_20%,rgba(78,229,133,0.1),transparent_70%)] animate-[drift-a_14s_ease-in-out_infinite_alternate]"
-      ></div>
-      <div
-        class="pointer-events-none absolute -inset-x-96 -top-24 h-[30rem] blur-[10px] [background:radial-gradient(32rem_18rem_at_66%_30%,rgba(167,139,250,0.07),transparent_70%)] animate-[drift-b_18s_ease-in-out_infinite_alternate]"
-      ></div>
-
-      <div
         class="mx-auto grid w-[min(90rem,calc(100vw-7rem))] grid-cols-[minmax(21rem,27rem)_minmax(0,1fr)] items-center gap-12 max-xl:grid-cols-1 max-md:gap-6 max-md:w-[calc(100vw-2.5rem)]"
       >
         <div>
-          <p
-            class="mb-7 flex flex-wrap justify-start gap-2 opacity-0 animate-[rise_0.9s_cubic-bezier(0.16,1,0.3,1)_forwards] [animation-delay:0.05s] max-xl:justify-center"
-          >
-            <span class="rounded-full border border-line bg-raised/70 px-3 py-0.5 text-[0.72rem] tracking-[0.06em] text-dim backdrop-blur-sm">macOS</span>
-            <span class="rounded-full border border-line bg-raised/70 px-3 py-0.5 text-[0.72rem] tracking-[0.06em] text-dim backdrop-blur-sm">Linux</span>
-            <span class="rounded-full border border-line bg-raised/70 px-3 py-0.5 text-[0.72rem] tracking-[0.06em] text-dim backdrop-blur-sm">arm64 · x64</span>
-            <span class="rounded-full border border-mintdim bg-raised/70 px-3 py-0.5 text-[0.72rem] tracking-[0.06em] text-mint backdrop-blur-sm">MIT</span>
+          <p class="mb-7 text-[0.8rem] tracking-[0.06em] text-dim max-xl:text-center">
+            macOS <span class="text-faint">·</span> Linux
+            <span class="text-faint">·</span> arm64 <span class="text-faint">·</span> x64
+            <span class="text-faint">·</span> <span class="text-mint">MIT</span>
           </p>
           <h1
-            class="mb-6 text-[clamp(2.6rem,4.2vw,4.1rem)] font-semibold leading-[1.12] tracking-[-0.03em] text-bright opacity-0 animate-[rise_0.9s_cubic-bezier(0.16,1,0.3,1)_forwards] [animation-delay:0.15s]"
+            class="mb-6 text-[clamp(2.6rem,4.2vw,4.1rem)] font-semibold leading-[1.12] tracking-[-0.03em] text-bright"
           >
             <span>Your clipboard,</span><br />
-            <span
-              class="bg-clip-text text-transparent [background-image:linear-gradient(90deg,#4ee585_20%,#6dd3e8_40%,#4ee585_60%,#a7f3c8_80%,#4ee585)] [background-size:300%_100%] [filter:drop-shadow(0_0_22px_rgba(78,229,133,0.35))] animate-[shimmer_5s_linear_infinite]"
-            >everywhere.</span>
+            <span class="text-mint">everywhere.</span>
           </h1>
-          <p
-            class="mb-8 max-w-[38rem] text-[1.05rem] text-dim opacity-0 animate-[rise_0.9s_cubic-bezier(0.16,1,0.3,1)_forwards] [animation-delay:0.3s] max-xl:mx-auto"
-          >
+          <p class="mb-8 max-w-[38rem] text-[1.05rem] text-dim max-xl:mx-auto">
             Peer-to-peer clipboard sync over encrypted SSH.
-            Copy here, paste there — text, images, files, rich content, native formats intact.
+            Copy on one machine, paste on another: text, images, files, and rich
+            content in their native formats.
             <span class="text-amberish">Written in Rust ackchyually.</span>
           </p>
-          <div class="opacity-0 animate-[rise_0.9s_cubic-bezier(0.16,1,0.3,1)_forwards] [animation-delay:0.45s]">
-            <InstallPill />
-          </div>
+          <InstallPill />
         </div>
-        <div class="min-w-0 opacity-0 animate-[rise_0.9s_cubic-bezier(0.16,1,0.3,1)_forwards] [animation-delay:0.6s]">
+        <div class="min-w-0">
           <MeshDemo />
         </div>
       </div>
 
       <p
-        class="mt-10 flex flex-wrap justify-center gap-3.5 text-[0.85rem] tracking-[0.03em] text-dim opacity-0 animate-[rise_0.9s_cubic-bezier(0.16,1,0.3,1)_forwards] [animation-delay:0.8s] max-md:mt-7 max-md:gap-2 max-md:text-[0.78rem]"
+        class="mt-10 flex flex-wrap justify-center gap-3.5 text-[0.85rem] tracking-[0.03em] text-dim max-md:mt-7 max-md:gap-2 max-md:text-[0.78rem]"
       >
         <span><b class="font-bold text-mint">0</b> relays</span>
         <span class="text-faint">·</span>
@@ -170,16 +153,14 @@ const docLink =
 
     <!-- ── features ─────────────────────────── -->
     <section
-      class="mx-auto grid max-w-[46rem] grid-cols-[repeat(auto-fit,minmax(15rem,1fr))] gap-3.5 px-5 pb-4 pt-10"
+      class="mx-auto grid max-w-[46rem] grid-cols-[repeat(auto-fit,minmax(15rem,1fr))] gap-x-3.5 gap-y-5 px-5 pb-4 pt-10"
     >
       <div
         v-for="f in features"
         :key="f.name"
-        class="rounded-lg border border-line bg-panel p-4 transition-colors hover:border-linebright"
+        class="tui-block p-4 pt-3.5 transition-colors hover:border-linebright"
       >
-        <h3 class="mb-1.5 text-[0.95rem] font-semibold text-bright">
-          <span class="font-semibold text-mint">*</span> {{ f.name }}
-        </h3>
+        <span class="tui-title">{{ f.name }}</span>
         <p class="text-[0.85rem] leading-[1.6] text-dim">{{ f.text }}</p>
       </div>
     </section>
@@ -199,9 +180,9 @@ const docLink =
           v-for="s in sections"
           :key="s.id"
           :href="'#' + s.id"
-          class="relative w-fit py-1 transition-colors after:absolute after:inset-x-0 after:bottom-[0.05rem] after:h-px after:origin-left after:bg-mint after:transition-transform after:content-['']"
-          :class="activeId === s.id ? 'text-mint after:scale-x-100' : 'text-dim after:scale-x-0 hover:text-bright'"
-        >{{ s.title }}</a>
+          class="w-fit whitespace-pre py-1 transition-colors"
+          :class="activeId === s.id ? 'text-mint' : 'text-dim hover:text-bright'"
+        >{{ (activeId === s.id ? '▌ ' : '  ') + s.title }}</a>
       </aside>
 
       <div>
@@ -210,8 +191,8 @@ const docLink =
             <span class="text-mint">#</span> Install
           </h2>
           <p class="mb-4 max-w-[42rem]">
-            One package, two commands. The npm package is just the installer — the thing that
-            runs is a native Rust binary with a per-user background service
+            One package, two commands. The npm package installs a native Rust binary
+            with a per-user background service
             (<code>launchd</code> on macOS, <code>systemd</code> on Linux).
           </p>
           <CodeBlock
@@ -221,11 +202,11 @@ $ ssh-clipboard"
           <p class="mb-4 max-w-[42rem]">You'll need:</p>
           <ul class="mb-4 ml-6 list-disc space-y-1.5">
             <li>macOS or Linux (Wayland or X11), on arm64 or x64</li>
-            <li>Node ≥ 18 — only for <code>npm install</code>; the daemon has no Node dependency</li>
+            <li>Node ≥ 18 for <code>npm install</code>; the daemon has no Node dependency</li>
             <li>
-              Passwordless SSH between your machines —
+              Passwordless SSH between your machines.
               <a :class="docLink" href="https://tailscale.com/kb/1193/tailscale-ssh">Tailscale SSH</a> is perfect,
-              plain old <code>~/.ssh</code> keys work too
+              and plain <code>~/.ssh</code> keys work too
             </li>
           </ul>
         </section>
@@ -245,8 +226,7 @@ $ ssh-clipboard"
             <li>starts the per-user background service on both ends.</li>
           </ol>
           <p class="mb-4 max-w-[42rem]">
-            That's it. Copy on one machine, paste on another. After setup it just feels like
-            one clipboard — there is no step two.
+            Copy on one machine, paste on another. After setup it behaves like one clipboard.
           </p>
           <CodeBlock
             code="$ ssh-clipboard status
@@ -260,7 +240,7 @@ connected: macbookserver"
           <h2 class="mb-4 text-[1.35rem] font-semibold text-bright">
             <span class="text-mint">#</span> Commands
           </h2>
-          <dl class="my-5 overflow-hidden rounded-lg border border-line">
+          <dl class="my-5 overflow-hidden border border-line">
             <template v-for="c in commands" :key="c.cmd">
               <dt class="bg-panel px-4 pt-3">
                 <code class="border-0 bg-transparent p-0 font-semibold text-mint">{{ c.cmd }}</code>
@@ -282,20 +262,20 @@ connected: macbookserver"
           <h2 class="mb-4 text-[1.35rem] font-semibold text-bright">
             <span class="text-mint">#</span> How it works
           </h2>
-          <pre class="my-5 overflow-x-auto rounded-lg border border-line bg-panel px-5 py-4 text-[0.78rem] leading-[1.45] text-dim">
+          <pre class="my-5 overflow-x-auto border border-line bg-panel px-5 py-4 text-[0.78rem] leading-[1.45] text-dim">
 ┌──────────────┐         encrypted SSH         ┌──────────────┐
 │    macbook   │ ◀═══════════════════════════▶ │    fedora    │
 │  pasteboard  │    persistent · deduplicated  │ wayland/x11  │
 └──────────────┘         newest-wins           └──────────────┘</pre>
           <p class="mb-4 max-w-[42rem]">
             A small Rust daemon on each machine watches the system clipboard through native
-            backends — the macOS pasteboard, or Wayland/X11 on Linux. When the clipboard
+            backends: the macOS pasteboard, or Wayland/X11 on Linux. When the clipboard
             changes, it ships the raw bytes of <em>every available representation</em> to its
             peers over persistent SSH connections and writes them back natively on the other
             side.
           </p>
           <p class="mb-4 max-w-[42rem]">
-            There's no relay server, no cloud account, and no new cryptography — transport
+            There's no relay server, no cloud account, and no new cryptography. Transport
             security is exactly the SSH trust you already have between your machines. Values
             are deduplicated, and per-peer queues always deliver the newest value rather than
             replaying history.
@@ -309,7 +289,7 @@ connected: macbookserver"
           <p class="mb-4 max-w-[42rem]">
             Every daemon independently checks npm for the latest stable release and gossips
             its verified desired version to connected peers, so any online machine can trigger
-            the whole mesh to converge — there is no permanent update coordinator.
+            the whole mesh to converge. There is no permanent update coordinator.
           </p>
           <p class="mb-4 max-w-[42rem]">
             Packages are accepted only after the npm SHA-512 integrity hash, the bundled

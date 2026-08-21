@@ -1,534 +1,1039 @@
 <script setup>
-// All motion lives in @keyframes (src/style.css); everything else is utilities.
-const D = '[animation-delay:1.2s]'
+// Animated hero illustration, drawn entirely on a <canvas>.
+//
+// Story (16s loop), same beats as the original DOM/keyframe version:
+//   Beat A — a zoomed macOS desktop pops out of macbook, the user drags a
+//   screenshot selection (marching ants + crosshair + flash), and the
+//   captured thumbnail flies through the monitor to every peer.
+//   Beat B — a debian desktop pops out with a Claude Code session; the
+//   typed-for authorization code is copied and fans out the other way.
+// The center window is the `ssh-clipboard monitor` TUI logging it all.
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 
-const node =
-  'relative flex w-[8.5rem] flex-col items-center gap-1 rounded-[14px] border border-linebright px-[0.8rem] pb-2 pt-[0.55rem] text-faint [background:linear-gradient(180deg,#141c26,#0d131b)] shadow-[inset_0_1px_0_rgba(255,255,255,0.05),0_10px_24px_-14px_rgba(0,0,0,0.8)]'
+const wrap = ref(null)
+const cv = ref(null)
 
-const ping =
-  'pointer-events-none absolute -inset-px rounded-[14px] border-[1.5px] border-mint opacity-0'
+// Palette — keep in sync with the @theme block in src/style.css.
+const C = {
+  line: '#1c2836',
+  lineBright: '#2a3a4d',
+  bright: '#eef4fa',
+  dim: '#7b8a9a',
+  faint: '#55636f',
+  mint: '#4ee585',
+  tuiBg: '#13151b',
+  accent: '#a78bfa',
+  cyan: '#22d3ee',
+  green: '#34d399',
+  yellow: '#fbbf24',
+  muted: '#64748b',
+  soft: '#cbd5e1',
+  tuiPanel: '#334155',
+  chipBg: '#0f1620',
+  bg: '#0b0f14',
+}
 
-const mname = 'text-[0.85rem] font-semibold leading-[1.3] text-bright'
-const mos = 'text-[0.65rem] leading-[1.3] tracking-[0.06em] text-faint'
+const MONO = "ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace"
+const LOOP = 16000
 
-const wire =
-  'fill-none stroke-linebright [stroke-dasharray:3_6] [stroke-linecap:round] [stroke-width:1.25] [vector-effect:non-scaling-stroke] animate-[dashdrift_1.6s_linear_infinite]'
+// ── timeline (fractions of the loop, matching the old keyframes) ──
+const clamp01 = (v) => Math.max(0, Math.min(1, v))
+const seg = (t, a, b) => clamp01((t - a) / (b - a))
+// snappy settle, like the old cubic-bezier(0.22,1,0.36,1) desk-pop
+const outQuint = (p) => 1 - (1 - p) ** 5
+const inCubic = (p) => p ** 3
+// hard attack / hold / hard release, like the old stepped glow keyframes
+const trap = (p) => (p <= 0 || p >= 1 ? 0 : Math.min(1, p / 0.12, (1 - p) / 0.18))
 
-const bigdesk =
-  'absolute z-[6] w-[460px] overflow-hidden rounded-xl border-2 border-[#3d4c60] bg-[#0a0e14] opacity-0 shadow-[0_26px_60px_-20px_rgba(0,0,0,0.85),0_12px_50px_-20px_rgba(78,229,133,0.22)]'
+// Every effect follows its cause within ~0.3s; the tail after the code is
+// accepted is the deliberate resting state before the loop wraps.
+const T = {
+  // beat A — screenshot on the mac, fans out to everyone.
+  // The mac desktop is already open at t=0 (it opened at deskD last loop,
+  // showing the accepted code) and closes after the capture.
+  sel: [0.04, 0.105], // selection marquee + crosshair drag
+  flash: [0.115, 0.132],
+  deskAClose: [0.132, 0.162], // the pane dismisses fully…
+  flyA: [0.168, 0.205], // …then the shot leaves the node along its wire
+  sentTotal: 0.267, // 3 × 8.8 MiB, once all three sends complete
+  fanA: [0.215, 0.265], // monitor → all three peers, together
+  recvA: [0.265, 0.32],
+  // beat A2 — debian uses the image, window closes, that's it
+  deskB: [0.285, 0.32, 0.445, 0.475],
+  // beat B — fedora types its own request, gets a response with a code
+  // (clear air after debian's pane is fully gone)
+  deskC: [0.495, 0.53, 0.716, 0.746],
+  hlC: [0.676, 0.706], // copy highlight sweep, then the pane dismisses
+  flyB: [0.75, 0.79], // code rides fedora's wire back to the monitor
+  recvTotal: 0.795,
+  fanB: [0.805, 0.855], // monitor → debian, mini, macbook, together
+  recvB: [0.855, 0.91],
+  // loop closure — the code lands, the mac desktop opens, the pointer
+  // clicks into the field, the paste accepts; that end state is frame one
+  deskD: [0.875, 0.908],
+  macPtr: [0.9, 0.945], // pointer travel to the authorization field
+  codeFill: 0.948,
+  fade: [0.955, 0.99],
+}
 
-const menubarItem = 'h-[4.5px] rounded-sm bg-white/28'
+const IMG_PV = '<Apple PNG past…'
+const TXT_PV = '01923091283'
 
-const dwin =
-  'absolute left-[30px] top-[22px] w-[216px] overflow-hidden rounded-md border border-white/9 bg-[rgba(10,15,22,0.92)]'
-const dwinBar = 'flex gap-1 bg-white/5 px-2 py-1.5'
-const dwinBody = 'flex flex-col gap-1.5 px-2.5 pb-3 pt-2'
-const dl = 'h-1 rounded-sm bg-[#33465c]'
-const dot1 = 'h-1.5 w-1.5 rounded-full bg-[#ff5f57]'
-const dot2 = 'h-1.5 w-1.5 rounded-full bg-[#febc2e]'
-const dot3 = 'h-1.5 w-1.5 rounded-full bg-[#28c840]'
+// Rows append downward as the story advances.
+const ROWS = [
+  // each row appears when its payload reaches the monitor pane
+  { at: 0.205, time: '41.204', flow: '◆ copied here', fc: C.accent, pv: IMG_PV, size: '8.8 MiB', fm: '6' },
+  { at: 0.218, time: '41.530', flow: '→ fedora', fc: C.cyan, pv: IMG_PV, size: '8.8 MiB', fm: '6' },
+  { at: 0.224, time: '41.530', flow: '→ debian', fc: C.cyan, pv: IMG_PV, size: '8.8 MiB', fm: '6' },
+  { at: 0.23, time: '41.530', flow: '→ mini', fc: C.cyan, pv: IMG_PV, size: '8.8 MiB', fm: '6' },
+  { at: 0.792, time: '47.214', flow: '← fedora', fc: C.green, pv: TXT_PV, size: '11 B', fm: '1' },
+  { at: 0.808, time: '47.215', flow: '→ debian', fc: C.cyan, pv: TXT_PV, size: '11 B', fm: '1' },
+  { at: 0.814, time: '47.215', flow: '→ mini', fc: C.cyan, pv: TXT_PV, size: '11 B', fm: '1' },
+  { at: 0.82, time: '47.215', flow: '→ macbook', fc: C.cyan, pv: TXT_PV, size: '11 B', fm: '1' },
+]
 
-const photo =
-  'absolute left-[270px] top-[96px] h-[58px] w-[78px] overflow-hidden rounded-[5px] border-[1.5px] border-white/30 shadow-[0_8px_20px_-8px_rgba(0,0,0,0.6)] [background:linear-gradient(180deg,#2c4a7c_0%,#7a4a6e_62%,#d98a5f_100%)] before:absolute before:right-4 before:top-2.5 before:h-3 before:w-3 before:rounded-full before:bg-[#ffd9a0] before:shadow-[0_0_8px_rgba(255,217,160,0.8)] before:content-[""] after:absolute after:inset-x-0 after:bottom-0 after:h-[60%] after:bg-[#1a2437] after:[clip-path:polygon(0_100%,0_55%,26%_18%,48%_60%,70%_28%,100%_70%,100%_100%)] after:content-[""]'
+// ── desktop scenes (fixed 440×292 local coordinate space) ─────────
+const SCENE_W = 440
+const SCENE_H = 292
+// screenshot capture region, in scene coords — frames the sunset photo
+const CAP = { x: 252, y: 102, w: 116, h: 90 }
 
-const wpGlow =
-  'pointer-events-none absolute -right-[30px] -top-[30px] h-[200px] w-[200px] rounded-full [background:radial-gradient(circle,rgba(110,231,183,0.18),transparent_65%)]'
+function rr(ctx, x, y, w, h, r) {
+  ctx.beginPath()
+  ctx.roundRect(x, y, w, h, r)
+}
 
-const flyShot =
-  'pointer-events-none absolute left-0 top-0 z-[7] h-[138px] w-[205px] overflow-hidden rounded-[5px] border-[2.5px] border-bright opacity-0 shadow-[0_14px_32px_-8px_rgba(0,0,0,0.75)] [offset-rotate:0deg] motion-reduce:hidden'
+// classic arrow pointer, drawn at its hotspot
+function drawPointer(ctx, x, y) {
+  ctx.save()
+  ctx.translate(x, y)
+  ctx.beginPath()
+  ctx.moveTo(0, 0)
+  ctx.lineTo(0, 13)
+  ctx.lineTo(3, 10.5)
+  ctx.lineTo(5.2, 15)
+  ctx.lineTo(7.2, 14)
+  ctx.lineTo(5, 9.8)
+  ctx.lineTo(9, 9.5)
+  ctx.closePath()
+  ctx.fillStyle = '#ffffff'
+  ctx.fill()
+  ctx.strokeStyle = 'rgba(0,0,0,0.8)'
+  ctx.lineWidth = 1
+  ctx.stroke()
+  ctx.restore()
+}
 
-const shotInner =
-  'absolute left-[-166px] top-[-77px] h-[270px] w-[456px] [background:linear-gradient(135deg,#1c2c52_0%,#173a54_55%,#0f4a49_100%)]'
+function drawMacBase(ctx) {
+  // menubar
+  ctx.fillStyle = 'rgba(10,14,20,0.92)'
+  ctx.fillRect(0, 0, SCENE_W, 22)
+  ctx.fillStyle = '#aab6c4'
+  ctx.beginPath()
+  ctx.arc(13, 11, 4.5, 0, Math.PI * 2)
+  ctx.fill()
+  ctx.fillStyle = 'rgba(255,255,255,0.28)'
+  for (const [mx, mw] of [[26, 29], [61, 18], [85, 22], [396, 13]]) {
+    rr(ctx, mx, 8.5, mw, 4.5, 2)
+    ctx.fill()
+  }
+  ctx.fillStyle = 'rgba(255,255,255,0.6)'
+  ctx.font = `9.5px ${MONO}`
+  ctx.fillText('18:31', 414, 14.5)
+  // wallpaper
+  const wp = ctx.createLinearGradient(0, 22, SCENE_W, SCENE_H)
+  wp.addColorStop(0, '#1c2c52')
+  wp.addColorStop(0.55, '#173a54')
+  wp.addColorStop(1, '#0f4a49')
+  ctx.fillStyle = wp
+  ctx.fillRect(0, 22, SCENE_W, SCENE_H - 22)
+  const glow = ctx.createRadialGradient(410, 0, 0, 410, 0, 110)
+  glow.addColorStop(0, 'rgba(110,231,183,0.18)')
+  glow.addColorStop(1, 'rgba(110,231,183,0)')
+  ctx.fillStyle = glow
+  ctx.fillRect(300, 22, 140, 120)
+  // sunset photo (this is what gets captured)
+  const px = 270
+  const py = 118
+  ctx.save()
+  rr(ctx, px, py, 78, 58, 4)
+  ctx.clip()
+  const sky = ctx.createLinearGradient(0, py, 0, py + 58)
+  sky.addColorStop(0, '#2c4a7c')
+  sky.addColorStop(0.62, '#7a4a6e')
+  sky.addColorStop(1, '#d98a5f')
+  ctx.fillStyle = sky
+  ctx.fillRect(px, py, 78, 58)
+  ctx.fillStyle = '#ffd9a0'
+  ctx.shadowColor = 'rgba(255,217,160,0.8)'
+  ctx.shadowBlur = 8
+  ctx.beginPath()
+  ctx.arc(px + 58, py + 15, 6, 0, Math.PI * 2)
+  ctx.fill()
+  ctx.shadowBlur = 0
+  ctx.fillStyle = '#1a2437'
+  ctx.beginPath()
+  const mtn = [[0, 58], [0, 32], [20, 10.5], [37, 35], [55, 16], [78, 40], [78, 58]]
+  mtn.forEach(([mx, my], i) => (i ? ctx.lineTo(px + mx, py + my) : ctx.moveTo(px + mx, py + my)))
+  ctx.closePath()
+  ctx.fill()
+  ctx.restore()
+  ctx.strokeStyle = 'rgba(255,255,255,0.3)'
+  ctx.lineWidth = 1.5
+  rr(ctx, px, py, 78, 58, 4)
+  ctx.stroke()
+  // dock
+  rr(ctx, SCENE_W / 2 - 45, SCENE_H - 22, 90, 16, 5)
+  ctx.fillStyle = 'rgba(255,255,255,0.1)'
+  ctx.fill()
+  const apps = ['#5aa7f7', '#4ee585', '#f7b955', '#d78bea', '#8b97a5']
+  apps.forEach((ac, i) => {
+    ctx.fillStyle = ac
+    rr(ctx, SCENE_W / 2 - 39 + i * 16, SCENE_H - 19, 10, 10, 3)
+    ctx.fill()
+  })
+}
 
-const flyText =
-  'pointer-events-none absolute left-0 top-0 z-[7] w-[112px] rounded-[5px] border-[1.5px] border-[#7ee7ab] bg-[#0f1620] px-2 py-[5px] text-center text-[9.5px] leading-[1.35] text-[#e6edf5] opacity-0 shadow-[0_12px_26px_-8px_rgba(0,0,0,0.75)] [offset-rotate:0deg] motion-reduce:hidden'
+// The mac's second window: an app waiting for the authorization code.
+// It closes the loop — end state (code accepted) is also frame one.
+function drawMacCodeWindow(ctx, t, now) {
+  const success = t < 0.2 || t >= T.codeFill + 0.017
+  const filled = success || t >= T.codeFill
+  rr(ctx, 30, 44, 216, 66, 5)
+  ctx.fillStyle = 'rgba(10,15,22,0.92)'
+  ctx.fill()
+  ctx.strokeStyle = 'rgba(255,255,255,0.09)'
+  ctx.lineWidth = 1
+  ctx.stroke()
+  ctx.fillStyle = 'rgba(255,255,255,0.05)'
+  ctx.fillRect(30, 44, 216, 12)
+  for (const [dx, dc] of [[38, '#ff5f57'], [47, '#febc2e'], [56, '#28c840']]) {
+    ctx.fillStyle = dc
+    ctx.beginPath()
+    ctx.arc(dx, 50, 3, 0, Math.PI * 2)
+    ctx.fill()
+  }
+  ctx.font = `8px ${MONO}`
+  ctx.fillStyle = 'rgba(255,255,255,0.45)'
+  ctx.fillText('authorize', 66, 52.5)
+  ctx.font = `9.5px ${MONO}`
+  ctx.fillStyle = C.soft
+  ctx.fillText('Authorization code:', 40, 70)
+  // input field
+  ctx.strokeStyle = 'rgba(255,255,255,0.2)'
+  rr(ctx, 40, 76, 130, 16, 3)
+  ctx.stroke()
+  if (filled) {
+    // paste highlight fades right after the fill
+    const hl = 1 - seg(t, T.codeFill, T.codeFill + 0.04)
+    ctx.font = `600 9.5px ${MONO}`
+    if (hl > 0 && t >= 0.2) {
+      ctx.fillStyle = `rgba(78,229,133,${0.3 * hl})`
+      ctx.fillRect(44, 78.5, ctx.measureText(TXT_PV).width + 4, 11)
+    }
+    ctx.fillStyle = '#7ee7ab'
+    ctx.fillText(TXT_PV, 46, 87.5)
+  } else if (Math.floor(now / 450) % 2 === 0) {
+    ctx.fillStyle = C.soft
+    ctx.fillRect(46, 79, 4.5, 10)
+  }
+  if (success) {
+    ctx.font = `600 9.5px ${MONO}`
+    ctx.fillStyle = C.mint
+    ctx.fillText('✓ accepted', 178, 87.5)
+  }
+  // end of loop: pointer clicks into the field right before the paste
+  if (t > 0.5) {
+    const p = 1 - (1 - seg(t, T.macPtr[0], T.macPtr[1])) ** 3
+    drawPointer(ctx, 300 + (105 - 300) * p, 215 + (86 - 215) * p)
+  }
+}
 
-const ftSent = 'rounded-sm bg-mint/20 px-0.5'
+function drawMacOverlays(ctx, t, now) {
+  // pointer walks from the field to the capture corner (continuing where
+  // last loop's paste click left it), then the crosshair takes over
+  if (t > 0.004 && t < T.sel[0]) {
+    const p = 1 - (1 - seg(t, 0.005, T.sel[0])) ** 3
+    drawPointer(ctx, 105 + (CAP.x - 2 - 105) * p, 86 + (CAP.y - 2 - 86) * p)
+  }
+  const selP = seg(t, T.sel[0], T.sel[1])
+  const selDone = t > T.sel[1] && t < T.flash[1] + 0.01
+  if ((selP > 0 && t < T.flash[1]) || selDone) {
+    const sw = CAP.w * (selDone ? 1 : selP)
+    const sh = CAP.h * (selDone ? 1 : selP)
+    // dim everything outside the selection
+    ctx.save()
+    ctx.beginPath()
+    ctx.rect(0, 22, SCENE_W, SCENE_H - 22)
+    ctx.rect(CAP.x, CAP.y, sw, sh)
+    ctx.clip('evenodd')
+    ctx.fillStyle = `rgba(0,0,0,${0.35 * Math.min(1, selP * 4)})`
+    ctx.fillRect(0, 22, SCENE_W, SCENE_H - 22)
+    ctx.restore()
+    // marching ants
+    ctx.strokeStyle = '#ffffff'
+    ctx.lineWidth = 1.4
+    ctx.setLineDash([4, 4])
+    ctx.lineDashOffset = -(now / 45)
+    ctx.strokeRect(CAP.x, CAP.y, sw, sh)
+    ctx.setLineDash([])
+    // crosshair rides the drag corner
+    if (t < T.sel[1] + 0.015) {
+      const cx = CAP.x + sw
+      const cy = CAP.y + sh
+      ctx.strokeStyle = '#ffffff'
+      ctx.lineWidth = 1.3
+      ctx.beginPath()
+      ctx.moveTo(cx - 6, cy)
+      ctx.lineTo(cx + 6, cy)
+      ctx.moveTo(cx, cy - 6)
+      ctx.lineTo(cx, cy + 6)
+      ctx.stroke()
+    }
+  }
+  // camera flash: instant full brightness, quick decay
+  const flp = seg(t, T.flash[0], T.flash[1])
+  const fl = flp <= 0 || flp >= 1 ? 0 : (1 - flp) ** 1.5
+  if (fl > 0.01) {
+    ctx.fillStyle = `rgba(234,246,255,${fl * 0.6})`
+    ctx.fillRect(0, 0, SCENE_W, SCENE_H)
+  }
+}
 
-const tower =
-  'M39 8.5h16M39 12.5h16M39 16.5h16'
+// A Linux desktop with a Claude Code terminal. `o` selects the beat:
+//   { host, bar, wp: [c0, c1, c2],
+//     typeWin | null (null → prompt pre-filled), imgAt, cursorUntil,
+//     replyAt | null, codeAt, hlWin }
+function drawTermScene(ctx, t, now, o) {
+  // menubar
+  ctx.fillStyle = o.bar
+  ctx.fillRect(0, 0, SCENE_W, 22)
+  ctx.fillStyle = 'rgba(255,255,255,0.28)'
+  rr(ctx, 12, 8.5, 22, 4.5, 2)
+  ctx.fill()
+  ctx.fillStyle = 'rgba(255,255,255,0.6)'
+  ctx.font = `9.5px ${MONO}`
+  ctx.textAlign = 'center'
+  ctx.fillText('18:31', SCENE_W / 2, 14.5)
+  ctx.textAlign = 'left'
+  ctx.fillStyle = 'rgba(255,255,255,0.3)'
+  for (let i = 0; i < 3; i++) {
+    ctx.beginPath()
+    ctx.arc(SCENE_W - 40 + i * 11, 11, 2.5, 0, Math.PI * 2)
+    ctx.fill()
+  }
+  // wallpaper
+  const wp = ctx.createLinearGradient(0, 22, SCENE_W, SCENE_H)
+  wp.addColorStop(0, o.wp[0])
+  wp.addColorStop(0.55, o.wp[1])
+  wp.addColorStop(1, o.wp[2])
+  ctx.fillStyle = wp
+  ctx.fillRect(0, 22, SCENE_W, SCENE_H - 22)
+  // claude code terminal
+  const wx = 26
+  const wy = 46
+  const ww = 340
+  rr(ctx, wx, wy, ww, 118, 6)
+  ctx.fillStyle = 'rgba(12,12,18,0.96)'
+  ctx.fill()
+  ctx.strokeStyle = 'rgba(255,255,255,0.1)'
+  ctx.lineWidth = 1
+  ctx.stroke()
+  ctx.fillStyle = 'rgba(255,255,255,0.05)'
+  ctx.fillRect(wx, wy, ww, 14)
+  for (const [dx, dc] of [[wx + 9, '#ff5f57'], [wx + 18, '#febc2e'], [wx + 27, '#28c840']]) {
+    ctx.fillStyle = dc
+    ctx.beginPath()
+    ctx.arc(dx, wy + 7, 3, 0, Math.PI * 2)
+    ctx.fill()
+  }
+  ctx.fillStyle = 'rgba(255,255,255,0.45)'
+  ctx.font = `8px ${MONO}`
+  ctx.fillText(o.host, wx + 38, wy + 10)
+  // prompt box
+  const bx = wx + 10
+  const by = wy + 24
+  ctx.strokeStyle = 'rgba(255,255,255,0.2)'
+  rr(ctx, bx, by, ww - 20, 22, 3)
+  ctx.stroke()
+  ctx.font = `600 10px ${MONO}`
+  ctx.fillStyle = '#d97757'
+  ctx.fillText('>', bx + 8, by + 15)
+  const typed = o.prompt
+  const n = o.typeWin ? Math.floor(seg(t, o.typeWin[0], o.typeWin[1]) * typed.length) : typed.length
+  ctx.font = `10px ${MONO}`
+  ctx.fillStyle = C.soft
+  ctx.fillText(typed.slice(0, n), bx + 18, by + 15)
+  let cx = bx + 18 + ctx.measureText(typed.slice(0, n)).width
+  if (o.imgAt != null && t >= o.imgAt) {
+    const chip = '[Image #1]'
+    ctx.font = `8.5px ${MONO}`
+    const cw = ctx.measureText(chip).width + 8
+    ctx.fillStyle = 'rgba(110,168,254,0.16)'
+    rr(ctx, cx + 4, by + 5.5, cw, 12, 3)
+    ctx.fill()
+    ctx.fillStyle = '#8fb8ff'
+    ctx.fillText(chip, cx + 8, by + 14.5)
+    cx += cw + 8
+  }
+  // cursor
+  if (o.cursorUntil && t < o.cursorUntil && Math.floor(now / 450) % 2 === 0) {
+    ctx.fillStyle = C.soft
+    ctx.fillRect(cx + 4, by + 5.5, 5, 11)
+  }
+  // reply
+  if (o.replyAt && t >= o.replyAt) {
+    ctx.font = `8px ${MONO}`
+    ctx.fillStyle = C.mint
+    ctx.fillText('⏺', bx + 2, by + 40)
+    ctx.font = `10px ${MONO}`
+    ctx.fillStyle = C.soft
+    ctx.fillText("Here's your authorization code:", bx + 14, by + 40)
+  }
+  if (o.codeAt && t >= o.codeAt) {
+    ctx.font = `600 10.5px ${MONO}`
+    const codeW = ctx.measureText(TXT_PV).width
+    const hl = seg(t, o.hlWin[0], o.hlWin[1])
+    if (hl > 0 && t < o.hlWin[1] + 0.015) {
+      ctx.fillStyle = 'rgba(78,229,133,0.3)'
+      ctx.fillRect(bx + 12, by + 50, (codeW + 6) * hl, 14)
+    }
+    ctx.fillStyle = '#7ee7ab'
+    ctx.fillText(TXT_PV, bx + 15, by + 61)
+  }
+  // debian: pointer clicks into the prompt to focus it before typing
+  if (o.ptrWin && t >= o.ptrWin[0]) {
+    const p = 1 - (1 - seg(t, o.ptrWin[0], o.ptrWin[1])) ** 3
+    drawPointer(ctx, 300 + (bx + 60 - 300) * p, 225 + (by + 18 - 225) * p)
+  }
+  // fedora: pointer performs the copy — approaches the code, then drags
+  // across it in lockstep with the selection highlight
+  if (o.copyApproach && t >= o.copyApproach[0]) {
+    ctx.font = `600 10.5px ${MONO}`
+    const codeW = ctx.measureText(TXT_PV).width
+    const startX = bx + 13
+    const y = by + 63
+    const a = 1 - (1 - seg(t, o.copyApproach[0], o.copyApproach[1])) ** 3
+    let x = 300 + (startX - 300) * a
+    const py = 225 + (y - 225) * a
+    if (t >= o.hlWin[0]) x = startX + (codeW + 6) * seg(t, o.hlWin[0], o.hlWin[1])
+    drawPointer(ctx, x, py)
+  }
+}
 
-/* monitor */
-const muted = 'text-tuimuted'
-const soft = 'text-tuisoft'
-const panel = 'relative rounded-lg border border-tuipanel px-3.5 pb-2 pt-2.5'
-const panelTitle =
-  'absolute -top-[0.72em] left-3 bg-tuibg px-2 text-[0.68rem] font-bold tracking-[0.02em] text-tuiaccent'
-const peerB = 'font-bold text-tuisoft'
-const sep = 'text-tuipanel'
-const rowGrid =
-  'grid grid-cols-[4em_7.6em_minmax(0,1fr)_4.6em_4.4em] gap-x-2.5 whitespace-nowrap'
-const trow = rowGrid + ' h-0 overflow-hidden opacity-0 [clip-path:inset(0_100%_0_0)]'
-const cellPv = 'overflow-hidden text-ellipsis text-tuisoft'
-const num = 'text-right text-tuimuted'
+const DEB_SCENE = {
+  host: 'claude — debian',
+  bar: '#191225',
+  wp: ['#2b1436', '#55204a', '#7c2d52'],
+  prompt: 'A bit more like this',
+  ptrWin: [0.295, 0.35],
+  typeWin: [0.355, 0.415],
+  imgAt: 0.425,
+  cursorUntil: 0.44,
+  replyAt: null,
+  codeAt: null,
+}
+
+// A different machine, its own conversation — no shared context
+const FED_SCENE = {
+  host: 'claude — fedora',
+  bar: '#101c2a',
+  wp: ['#0f2a4a', '#14406b', '#0f5a62'],
+  prompt: 'log me into the registry',
+  copyApproach: [0.638, 0.672],
+  typeWin: [0.535, 0.6],
+  imgAt: null,
+  cursorUntil: 0.625,
+  replyAt: 0.625,
+  codeAt: 0.633,
+  hlWin: [0.676, 0.706],
+}
+
+// ── layout ────────────────────────────────────────────────────────
+function curve(p0, p1, vertical) {
+  const c1 = vertical
+    ? { x: p0.x, y: p0.y + (p1.y - p0.y) * 0.45 }
+    : { x: p0.x + (p1.x - p0.x) * 0.45, y: p0.y }
+  const c2 = vertical
+    ? { x: p1.x, y: p1.y - (p1.y - p0.y) * 0.45 }
+    : { x: p1.x - (p1.x - p0.x) * 0.45, y: p1.y }
+  return {
+    at(t) {
+      const u = 1 - t
+      return {
+        x: u * u * u * p0.x + 3 * u * u * t * c1.x + 3 * u * t * t * c2.x + t * t * t * p1.x,
+        y: u * u * u * p0.y + 3 * u * u * t * c1.y + 3 * u * t * t * c2.y + t * t * t * p1.y,
+      }
+    },
+    p0,
+    c1,
+    c2,
+    p1,
+  }
+}
+
+function monitorHeight(fs) {
+  const lh = fs * 1.62
+  return Math.round(14 * lh + 108)
+}
+
+function layout(w) {
+  const NW = 118
+  const NH = 96
+  const wide = w >= 620
+  const nodes = {}
+  let mon, fs, H, sceneScale
+  if (wide) {
+    const monW = Math.max(300, Math.min(470, w - 2 * NW - 4 * 26))
+    fs = Math.max(9, Math.min(12, monW / 40))
+    const monH = monitorHeight(fs)
+    H = Math.max(monH + 56, 476)
+    mon = { x: (w - monW) / 2, y: (H - monH) / 2 + 14, w: monW, h: monH }
+    nodes.macbook = { x: 8, y: H - NH - 6, w: NW, h: NH }
+    const rx = w - NW - 8
+    const gap = (H - 3 * NH) / 4
+    nodes.fedora = { x: rx, y: gap, w: NW, h: NH }
+    nodes.debian = { x: rx, y: gap * 2 + NH, w: NW, h: NH }
+    nodes.mini = { x: rx, y: gap * 3 + NH * 2, w: NW, h: NH }
+    sceneScale = Math.min(1, (w * 0.46) / SCENE_W)
+  } else {
+    const monW = Math.min(440, w - 8)
+    fs = Math.max(8.5, Math.min(11, monW / 40))
+    const monH = monitorHeight(fs)
+    const gap = 46
+    H = NH + gap + monH + gap + NH + 16
+    mon = { x: (w - monW) / 2, y: NH + gap + 8, w: monW, h: monH }
+    nodes.macbook = { x: (w - NW) / 2, y: 8, w: NW, h: NH }
+    const bw = Math.min(NW, (w - 32) / 3)
+    const by = mon.y + monH + gap
+    const bgap = (w - 3 * bw) / 4
+    nodes.fedora = { x: bgap, y: by, w: bw, h: NH }
+    nodes.mini = { x: bgap * 2 + bw, y: by, w: bw, h: NH }
+    nodes.debian = { x: bgap * 3 + bw * 2, y: by, w: bw, h: NH }
+    sceneScale = Math.min(1, (w - 16) / SCENE_W)
+  }
+  const cx = (r) => r.x + r.w / 2
+  const cy = (r) => r.y + r.h / 2
+  const wires = {}
+  let deskARect, deskBRect
+  if (wide) {
+    wires.macbook = curve({ x: nodes.macbook.x + NW, y: cy(nodes.macbook) }, { x: mon.x, y: mon.y + mon.h * 0.72 }, false)
+    wires.fedora = curve({ x: mon.x + mon.w, y: mon.y + mon.h * 0.24 }, { x: nodes.fedora.x, y: cy(nodes.fedora) }, false)
+    wires.debian = curve({ x: mon.x + mon.w, y: mon.y + mon.h * 0.5 }, { x: nodes.debian.x, y: cy(nodes.debian) }, false)
+    wires.mini = curve({ x: mon.x + mon.w, y: mon.y + mon.h * 0.76 }, { x: nodes.mini.x, y: cy(nodes.mini) }, false)
+    deskARect = { x: 8, y: 8 }
+    deskBRect = { x: w - SCENE_W * sceneScale - 8, y: 8 }
+  } else {
+    wires.macbook = curve({ x: cx(nodes.macbook), y: nodes.macbook.y + nodes.macbook.h }, { x: cx(mon), y: mon.y }, true)
+    for (const n of ['fedora', 'mini', 'debian']) {
+      wires[n] = curve({ x: cx(nodes[n]), y: mon.y + mon.h }, { x: cx(nodes[n]), y: nodes[n].y }, true)
+    }
+    deskARect = { x: (w - SCENE_W * sceneScale) / 2, y: 8 }
+    deskBRect = { x: (w - SCENE_W * sceneScale) / 2, y: mon.y + mon.h - SCENE_H * sceneScale + 24 }
+  }
+  return { w, H, fs, mon, nodes, wires, wide, sceneScale, deskARect, deskBRect }
+}
+
+// ── shared drawing helpers ────────────────────────────────────────
+function font(ctx, fs, bold) {
+  ctx.font = `${bold ? '600 ' : ''}${fs}px ${MONO}`
+}
+
+function spans(ctx, x, y, fs, list, maxX) {
+  let px = x
+  for (const s of list) {
+    font(ctx, s.fs || fs, s.b)
+    if (maxX && px + ctx.measureText(s.t).width > maxX) break
+    ctx.fillStyle = s.c
+    ctx.fillText(s.t, px, y)
+    px += ctx.measureText(s.t).width
+  }
+  return px
+}
+
+function tuiBlock(ctx, r, title, fs, borderColor, titleColor, bgColor) {
+  if (bgColor) {
+    ctx.fillStyle = bgColor
+    ctx.fillRect(r.x, r.y, r.w, r.h)
+  }
+  ctx.strokeStyle = borderColor
+  ctx.lineWidth = 1
+  ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1)
+  if (title) {
+    font(ctx, fs, true)
+    const tw = ctx.measureText(title).width
+    ctx.fillStyle = bgColor || C.bg
+    ctx.fillRect(r.x + 9, r.y - fs * 0.7, tw + 10, fs * 1.4)
+    ctx.fillStyle = titleColor
+    ctx.fillText(title, r.x + 14, r.y + fs * 0.36)
+  }
+}
+
+function drawIcon(ctx, kind, cx, cy, led) {
+  ctx.save()
+  ctx.translate(cx, cy)
+  ctx.strokeStyle = C.lineBright
+  ctx.lineWidth = 1.4
+  ctx.lineJoin = 'round'
+  if (kind === 'laptop') {
+    ctx.strokeRect(-17, -15, 34, 22)
+    ctx.beginPath()
+    ctx.moveTo(-24, 11)
+    ctx.lineTo(24, 11)
+    ctx.stroke()
+    ctx.strokeStyle = C.mint
+    ctx.globalAlpha = 0.35 + led * 0.65
+    ctx.beginPath()
+    ctx.moveTo(-12, -9)
+    ctx.lineTo(-1, -9)
+    ctx.moveTo(-12, -5)
+    ctx.lineTo(-5, -5)
+    ctx.moveTo(-12, -1)
+    ctx.lineTo(-3, -1)
+    ctx.stroke()
+  } else if (kind === 'tower') {
+    ctx.strokeRect(-9, -17, 18, 34)
+    ctx.beginPath()
+    ctx.moveTo(-5, -11)
+    ctx.lineTo(5, -11)
+    ctx.moveTo(-5, -7)
+    ctx.lineTo(5, -7)
+    ctx.moveTo(-5, -1)
+    ctx.lineTo(5, -1)
+    ctx.stroke()
+    ctx.fillStyle = C.mint
+    ctx.globalAlpha = 0.35 + led * 0.65
+    ctx.fillRect(-5, 7, 2.4, 8)
+  } else {
+    ctx.strokeRect(-19, -9, 38, 18)
+    ctx.beginPath()
+    ctx.arc(0, 0, 5, 0, Math.PI * 2)
+    ctx.stroke()
+    ctx.fillStyle = C.mint
+    ctx.globalAlpha = 0.35 + led * 0.65
+    ctx.beginPath()
+    ctx.arc(13, 4, 1.8, 0, Math.PI * 2)
+    ctx.fill()
+  }
+  ctx.restore()
+}
+
+function drawNode(ctx, r, name, backend, kind, recv, copy) {
+  const border = recv > 0.02 ? C.mint : copy > 0.02 ? C.accent : C.line
+  tuiBlock(ctx, r, name, 11, border, recv > 0.02 ? C.mint : copy > 0.02 ? C.accent : C.dim)
+  const glow = Math.max(recv, copy)
+  if (glow > 0.02) {
+    ctx.save()
+    ctx.globalAlpha = glow * 0.55
+    ctx.strokeStyle = recv >= copy ? C.mint : C.accent
+    const g = 3 + glow * 4
+    ctx.strokeRect(r.x - g + 0.5, r.y - g + 0.5, r.w + g * 2 - 1, r.h + g * 2 - 1)
+    ctx.restore()
+  }
+  drawIcon(ctx, kind, r.x + r.w / 2, r.y + r.h / 2 + 2, Math.max(recv, copy))
+  font(ctx, 9.5, false)
+  ctx.fillStyle = C.faint
+  ctx.textAlign = 'center'
+  ctx.fillText(backend, r.x + r.w / 2, r.y + r.h - 9)
+  ctx.textAlign = 'left'
+}
+
+function drawMonitor(ctx, L, t, now) {
+  const { mon, fs } = L
+  const lh = fs * 1.62
+  const p = Math.round(fs * 1.2)
+  tuiBlock(ctx, mon, ' ssh-clipboard monitor ', fs, C.lineBright, C.dim, C.tuiBg)
+  const x = mon.x + p
+  const iw = mon.w - p * 2
+  let y = mon.y + p + lh * 0.6
+
+  font(ctx, fs, true)
+  const head = [
+    { t: 'ssh', c: C.accent, b: true },
+    { t: ' ◇ ', c: C.soft },
+    { t: 'clipboard', c: C.accent, b: true },
+    { t: '   ', c: C.soft },
+    { t: '● LIVE', c: C.green, b: true },
+  ]
+  let hw = 0
+  for (const s of head) hw += ctx.measureText(s.t).width
+  const livePulse = 0.62 + 0.38 * Math.sin((now / 2400) * Math.PI * 2)
+  ctx.save()
+  spans(ctx, mon.x + (mon.w - hw) / 2, y, fs, head.slice(0, 4))
+  ctx.globalAlpha = livePulse
+  spans(ctx, mon.x + (mon.w - hw) / 2 + hw - ctx.measureText('● LIVE').width, y, fs, [head[4]])
+  ctx.restore()
+  y += lh * 0.95
+  font(ctx, fs * 0.88, false)
+  ctx.fillStyle = C.muted
+  ctx.textAlign = 'center'
+  ctx.fillText('native clipboard · persistent SSH · zero cloud hops', mon.x + mon.w / 2, y)
+  ctx.textAlign = 'left'
+  y += lh * 0.9
+
+  const peersR = { x, y, w: iw, h: lh * 2 + 14 }
+  tuiBlock(ctx, peersR, 'Peers', fs * 0.82, C.tuiPanel, C.accent, C.tuiBg)
+  let py = y + lh * 0.62 + 7
+  spans(
+    ctx,
+    x + 10,
+    py,
+    fs * 0.88,
+    [
+      { t: '● ', c: C.green },
+      { t: 'macbook ', c: C.soft, b: true },
+      { t: 'this machine', c: C.muted },
+      { t: ' │ ', c: C.tuiPanel },
+      { t: '● ', c: C.green },
+      { t: 'debian ', c: C.soft, b: true },
+      { t: 'v0.2.1', c: C.muted },
+      { t: ' │ ', c: C.tuiPanel },
+      { t: '● ', c: C.green },
+      { t: 'fedora ', c: C.soft, b: true },
+      { t: 'v0.2.1', c: C.muted },
+      { t: ' │ ', c: C.tuiPanel },
+      { t: '● ', c: C.yellow },
+      { t: 'mini ', c: C.soft, b: true },
+      { t: 'outdated', c: C.yellow },
+    ],
+    x + iw - 8
+  )
+  py += lh
+  spans(
+    ctx,
+    x + 10,
+    py,
+    fs * 0.88,
+    [
+      { t: 'backend ', c: C.muted },
+      { t: 'NSPasteboard', c: C.soft },
+      { t: '  version ', c: C.muted },
+      { t: '0.2.1', c: C.soft },
+      { t: '  sent ', c: C.muted },
+      { t: t >= T.sentTotal ? '26.4 MiB' : '—', c: t >= T.sentTotal ? C.soft : C.muted },
+      { t: '  received ', c: C.muted },
+      { t: t >= T.recvTotal ? '11 B' : '—', c: t >= T.recvTotal ? C.soft : C.muted },
+    ],
+    x + iw - 8
+  )
+  y += peersR.h + lh * 0.85
+
+  const actR = { x, y, w: iw, h: lh * 9.4 + 14 }
+  tuiBlock(ctx, actR, 'Clipboard activity', fs * 0.82, C.tuiPanel, C.accent, C.tuiBg)
+  const rfs = fs * 0.88
+  font(ctx, rfs, false)
+  const ch = ctx.measureText('0').width
+  const showFm = iw > 40 * ch
+  const cTime = x + 10
+  const cFlow = cTime + ch * 7
+  const cFm = x + iw - 10
+  const cSize = showFm ? cFm - ch * 4 : cFm
+  const cPv = cFlow + ch * 14.5
+  const pvMax = cSize - ch * 9 - cPv
+  let ry = y + lh * 0.62 + 7
+  font(ctx, rfs * 0.92, true)
+  ctx.fillStyle = C.muted
+  ctx.fillText('TIME', cTime, ry)
+  ctx.fillText('FLOW', cFlow, ry)
+  ctx.fillText('CONTENT', cPv, ry)
+  ctx.textAlign = 'right'
+  ctx.fillText('SIZE', cSize, ry)
+  if (showFm) ctx.fillText('FMT', cFm, ry)
+  ctx.textAlign = 'left'
+  ry += lh
+  ctx.save()
+  ctx.globalAlpha = 1 - seg(t, T.fade[0], T.fade[1])
+  for (const row of ROWS) {
+    const tp = seg(t, row.at, row.at + 0.02)
+    if (tp <= 0) break
+    ctx.save()
+    ctx.beginPath()
+    ctx.rect(x, ry - lh, iw * tp, lh * 1.3)
+    ctx.clip()
+    font(ctx, rfs, false)
+    ctx.fillStyle = C.muted
+    ctx.fillText(row.time, cTime, ry)
+    font(ctx, rfs, true)
+    ctx.fillStyle = row.fc
+    ctx.fillText(row.flow, cFlow, ry)
+    font(ctx, rfs, false)
+    ctx.fillStyle = C.soft
+    let pv = row.pv
+    while (pv.length > 1 && ctx.measureText(pv).width > pvMax) pv = pv.slice(0, -2) + '…'
+    ctx.fillText(pv, cPv, ry)
+    ctx.textAlign = 'right'
+    ctx.fillStyle = C.muted
+    ctx.fillText(row.size, cSize, ry)
+    if (showFm) ctx.fillText(row.fm, cFm, ry)
+    ctx.textAlign = 'left'
+    ctx.restore()
+    ry += lh
+  }
+  ctx.restore()
+
+  const fy = mon.y + mon.h - p - lh * 0.1
+  const foot = [
+    { t: 'p', c: C.cyan, b: true },
+    { t: ' pause · ', c: C.muted },
+    { t: 'c', c: C.cyan, b: true },
+    { t: ' clear · ', c: C.muted },
+    { t: 'q', c: C.cyan, b: true },
+    { t: ' close', c: C.muted },
+  ]
+  let fw = 0
+  for (const s of foot) {
+    font(ctx, fs * 0.88, s.b)
+    fw += ctx.measureText(s.t).width
+  }
+  spans(ctx, mon.x + (mon.w - fw) / 2, fy, fs * 0.88, foot)
+}
+
+// ── component ─────────────────────────────────────────────────────
+onMounted(() => {
+  const canvas = cv.value
+  const ctx = canvas.getContext('2d')
+  // dev hook: ?demot=0.6 freezes the loop at that point of the timeline
+  const demot = parseFloat(new URLSearchParams(window.location.search).get('demot'))
+  const frozen = Number.isFinite(demot)
+  const reduced = !frozen && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  let L = null
+  let dots = null
+  let macBase = null
+  let raf = 0
+  let visible = true
+  const start = performance.now()
+
+  function resize() {
+    const w = wrap.value.clientWidth
+    if (!w) return
+    L = layout(w)
+    const dpr = Math.min(window.devicePixelRatio || 1, 2)
+    canvas.width = Math.round(w * dpr)
+    canvas.height = Math.round(L.H * dpr)
+    canvas.style.height = `${L.H}px`
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    // static mac desktop, pre-rendered at 2x for crisp thumbnails
+    macBase = document.createElement('canvas')
+    macBase.width = SCENE_W * 2
+    macBase.height = SCENE_H * 2
+    const mctx = macBase.getContext('2d')
+    mctx.setTransform(2, 0, 0, 2, 0, 0)
+    drawMacBase(mctx)
+    // ambient dot grid
+    dots = document.createElement('canvas')
+    dots.width = canvas.width
+    dots.height = canvas.height
+    const dctx = dots.getContext('2d')
+    dctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    const cx = w / 2
+    const cy = L.H / 2
+    const maxD = Math.hypot(cx, cy)
+    dctx.fillStyle = C.line
+    for (let gy = 8; gy < L.H; gy += 22) {
+      for (let gx = 8; gx < w; gx += 22) {
+        const d = Math.hypot(gx - cx, gy - cy) / maxD
+        dctx.globalAlpha = Math.max(0, 0.9 - d * 1.4)
+        dctx.fillRect(gx, gy, 1.6, 1.6)
+      }
+    }
+    if (frozen) draw(demot, demot * LOOP)
+    else if (reduced) draw(0.9, 0)
+  }
+
+  // scale/alpha of a popped desktop; null when hidden
+  function popState(t, [a1, a2, b1, b2]) {
+    if (t < a1 || t > b2) return null
+    const grow = outQuint(seg(t, a1, a2))
+    const shrink = inCubic(seg(t, b1, b2))
+    return { s: 0.14 + 0.86 * (grow - grow * shrink), a: Math.min(1, grow * 6) * (1 - shrink) }
+  }
+
+  // desktop frame + wedge back to its node, then scene content
+  function drawDesk(pop, rect, origin, sceneDraw) {
+    const s = L.sceneScale
+    ctx.save()
+    ctx.globalAlpha = pop.a
+    // collapse toward the owning node
+    ctx.translate(origin.x, origin.y)
+    ctx.scale(pop.s, pop.s)
+    ctx.translate(-origin.x, -origin.y)
+    // callout wedge
+    ctx.fillStyle = 'rgba(78,229,133,0.035)'
+    ctx.strokeStyle = 'rgba(78,229,133,0.3)'
+    ctx.lineWidth = 1
+    ctx.setLineDash([3, 4])
+    ctx.beginPath()
+    ctx.moveTo(rect.x + 4, rect.y + SCENE_H * s)
+    ctx.lineTo(origin.x - 20, origin.y)
+    ctx.lineTo(origin.x + 20, origin.y)
+    ctx.lineTo(rect.x + SCENE_W * s - 4, rect.y + SCENE_H * s)
+    ctx.closePath()
+    ctx.fill()
+    ctx.stroke()
+    ctx.setLineDash([])
+    // frame
+    ctx.translate(rect.x, rect.y)
+    ctx.scale(s, s)
+    ctx.save()
+    rr(ctx, -2, -2, SCENE_W + 4, SCENE_H + 4, 10)
+    ctx.fillStyle = '#0a0e14'
+    ctx.fill()
+    ctx.strokeStyle = '#3d4c60'
+    ctx.lineWidth = 2
+    ctx.stroke()
+    rr(ctx, 0, 0, SCENE_W, SCENE_H, 8)
+    ctx.clip()
+    sceneDraw()
+    ctx.restore()
+    ctx.restore()
+  }
+
+  // the captured screenshot as a flying thumbnail
+  function drawShot(pos, scale, alpha) {
+    ctx.save()
+    ctx.globalAlpha = alpha
+    ctx.translate(pos.x, pos.y)
+    ctx.scale(scale, scale)
+    ctx.fillStyle = '#0a0e14'
+    ctx.fillRect(-CAP.w / 2 - 2, -CAP.h / 2 - 2, CAP.w + 4, CAP.h + 4)
+    ctx.save()
+    ctx.beginPath()
+    ctx.rect(-CAP.w / 2, -CAP.h / 2, CAP.w, CAP.h)
+    ctx.clip()
+    ctx.drawImage(macBase, CAP.x * 2, CAP.y * 2, CAP.w * 2, CAP.h * 2, -CAP.w / 2, -CAP.h / 2, CAP.w, CAP.h)
+    ctx.restore()
+    ctx.strokeStyle = C.bright
+    ctx.lineWidth = 2.5
+    ctx.strokeRect(-CAP.w / 2, -CAP.h / 2, CAP.w, CAP.h)
+    ctx.restore()
+  }
+
+  function drawTxtChip(pos, scale, alpha) {
+    ctx.save()
+    ctx.globalAlpha = alpha
+    ctx.translate(pos.x, pos.y)
+    ctx.scale(scale, scale)
+    font(ctx, 10.5, true)
+    const w = ctx.measureText(TXT_PV).width + 16
+    ctx.fillStyle = C.chipBg
+    ctx.fillRect(-w / 2, -11, w, 22)
+    ctx.strokeStyle = '#7ee7ab'
+    ctx.lineWidth = 1.4
+    ctx.strokeRect(-w / 2 + 0.5, -10.5, w - 1, 21)
+    ctx.fillStyle = C.bright
+    ctx.textAlign = 'center'
+    ctx.fillText(TXT_PV, 0, 3.6)
+    ctx.restore()
+    ctx.textAlign = 'left'
+  }
+
+  // constant-speed travel, absorbed on arrival — like the old linear
+  // offset-distance keyframes
+  function flight(wire, win, t, drawFn, s0, s1, fromEnd) {
+    const p = seg(t, win[0], win[1])
+    if (p <= 0 || p >= 1) return
+    const pos = wire.at(fromEnd ? 1 - p : p)
+    drawFn(pos, s0 + (s1 - s0) * p, 1)
+  }
+
+  function draw(t, now) {
+    const { w, H, nodes, wires, sceneScale: s } = L
+    ctx.clearRect(0, 0, w, H)
+    ctx.drawImage(dots, 0, 0, w, H)
+    ctx.strokeStyle = C.lineBright
+    ctx.lineWidth = 1.2
+    ctx.setLineDash([3, 6])
+    ctx.lineDashOffset = reduced ? 0 : -(now / 90)
+    for (const k of Object.keys(wires)) {
+      const wire = wires[k]
+      ctx.beginPath()
+      ctx.moveTo(wire.p0.x, wire.p0.y)
+      ctx.bezierCurveTo(wire.c1.x, wire.c1.y, wire.c2.x, wire.c2.y, wire.p1.x, wire.p1.y)
+      ctx.stroke()
+    }
+    ctx.setLineDash([])
+
+    drawNode(ctx, nodes.macbook, 'macbook', 'pasteboard', 'laptop',
+      trap(seg(t, T.recvB[0], T.recvB[1])), trap(seg(t, T.flash[0], T.flash[1] + 0.06)))
+    drawNode(ctx, nodes.fedora, 'fedora', 'wayland', 'tower',
+      trap(seg(t, T.recvA[0], T.recvA[1])), trap(seg(t, T.hlC[0], T.hlC[1] + 0.04)))
+    drawNode(ctx, nodes.debian, 'debian', 'x11', 'tower',
+      Math.max(trap(seg(t, T.recvA[0], T.recvA[1])), trap(seg(t, T.recvB[0], T.recvB[1]))), 0)
+    drawNode(ctx, nodes.mini, 'mini', 'pasteboard', 'mini',
+      Math.max(trap(seg(t, T.recvA[0], T.recvA[1])), trap(seg(t, T.recvB[0], T.recvB[1]))), 0)
+
+    drawMonitor(ctx, L, t, now)
+
+    if (reduced) return
+
+    // popped desktops
+    const nodeC = (r) => ({ x: r.x + r.w / 2, y: r.y + r.h / 2 })
+    // the mac desktop stays open across the loop boundary
+    let popA = null
+    if (t >= T.deskD[0]) {
+      const grow = outQuint(seg(t, T.deskD[0], T.deskD[1]))
+      popA = { s: 0.14 + 0.86 * grow, a: Math.min(1, grow * 6) }
+    } else if (t <= T.deskAClose[1]) {
+      const shrink = inCubic(seg(t, T.deskAClose[0], T.deskAClose[1]))
+      popA = { s: 1 - 0.86 * shrink, a: 1 - shrink }
+    }
+    if (popA) {
+      drawDesk(popA, L.deskARect, nodeC(nodes.macbook), () => {
+        ctx.drawImage(macBase, 0, 0, SCENE_W * 2, SCENE_H * 2, 0, 0, SCENE_W, SCENE_H)
+        drawMacCodeWindow(ctx, t, now)
+        drawMacOverlays(ctx, t, now)
+      })
+    }
+    const popB = popState(t, T.deskB)
+    if (popB) {
+      drawDesk(popB, L.deskBRect, nodeC(nodes.debian), () => drawTermScene(ctx, t, now, DEB_SCENE))
+    }
+    const popC = popState(t, T.deskC)
+    if (popC) {
+      drawDesk(popC, L.deskBRect, nodeC(nodes.fedora), () => drawTermScene(ctx, t, now, FED_SCENE))
+    }
+
+    // beat A: the desktop has dismissed; the shot leaves the node on its wire
+    flight(wires.macbook, T.flyA, t, drawShot, 0.42, 0.36, false)
+    // fan out to all three peers at once
+    flight(wires.fedora, T.fanA, t, drawShot, 0.32, 0.32, false)
+    flight(wires.debian, T.fanA, t, drawShot, 0.32, 0.32, false)
+    flight(wires.mini, T.fanA, t, drawShot, 0.32, 0.32, false)
+
+    // beat B: the code rides fedora's wire back, then out to the rest
+    flight(wires.fedora, T.flyB, t, drawTxtChip, 1, 0.75, true)
+    flight(wires.debian, T.fanB, t, drawTxtChip, 0.6, 0.6, false)
+    flight(wires.mini, T.fanB, t, drawTxtChip, 0.6, 0.6, false)
+    flight(wires.macbook, T.fanB, t, drawTxtChip, 0.6, 0.6, true)
+  }
+
+  function tick(now) {
+    raf = 0
+    if (!visible) return
+    draw(((now - start) % LOOP) / LOOP, now)
+    raf = requestAnimationFrame(tick)
+  }
+
+  const ro = new ResizeObserver(resize)
+  ro.observe(wrap.value)
+  const io = new IntersectionObserver(([entry]) => {
+    visible = entry.isIntersecting
+    if (visible && !reduced && !frozen && !raf) raf = requestAnimationFrame(tick)
+  })
+  io.observe(canvas)
+  resize()
+  if (!reduced && !frozen) raf = requestAnimationFrame(tick)
+
+  onBeforeUnmount(() => {
+    if (raf) cancelAnimationFrame(raf)
+    ro.disconnect()
+    io.disconnect()
+  })
+})
 </script>
 
 <template>
-  <div class="@container w-full" aria-hidden="true">
-    <div
-      class="relative mt-6 h-[calc(480px*var(--s))] [--s:0.95] @max-[1069px]:[--s:0.92] @max-[1000px]:[--s:0.88] @max-[940px]:[--s:0.82] @max-[880px]:[--s:0.77] @max-[820px]:[--s:0.72] @max-[760px]:[--s:0.66] @max-[700px]:[--s:0.62] @max-[660px]:h-[calc(900px*var(--s))] @max-[660px]:[--s:1] @max-[540px]:[--s:0.96] @max-[500px]:[--s:0.9] @max-[460px]:[--s:0.83] @max-[420px]:[--s:0.76] @max-[380px]:[--s:0.69] @max-[340px]:[--s:0.62] @max-[300px]:[--s:0.55]"
-    >
-      <div
-        class="absolute left-1/2 top-0 w-[63.5rem] origin-top [transform:translateX(-50%)_scale(var(--s))] @max-[660px]:w-[520px] before:pointer-events-none before:absolute before:-inset-x-4 before:-inset-y-12 before:content-[''] before:[background-image:radial-gradient(circle,#1c2836_1px,transparent_1px)] before:[background-size:22px_22px] before:[mask-image:radial-gradient(60%_70%_at_50%_50%,black_30%,transparent_75%)] after:pointer-events-none after:absolute after:-inset-x-8 after:-inset-y-16 after:opacity-55 after:content-[''] after:[background:radial-gradient(40rem_18rem_at_50%_50%,rgba(78,229,133,0.08),transparent_70%)] after:animate-[breathe_16s_ease-in-out_infinite] after:[animation-delay:1.2s]"
-      >
-        <div
-          class="relative grid h-[480px] grid-cols-[16rem_4.5rem_30rem_4.5rem_8.5rem] items-stretch justify-center @max-[660px]:h-[900px] @max-[660px]:grid-cols-[1fr] @max-[660px]:grid-rows-[130px_70px_480px_70px_150px]"
-        >
-          <!-- callout: the big desktop projects out of macbook -->
-          <svg
-            class="pointer-events-none absolute left-0 top-0 h-full w-[460px] opacity-0 animate-[callout-show_16s_infinite] @max-[660px]:hidden"
-            :class="D"
-            viewBox="0 0 460 480"
-          >
-            <polygon points="12,298 448,298 186,368 70,368" fill="rgba(78,229,133,0.035)" />
-            <path d="M12,298 L70,368" stroke="rgba(78,229,133,0.3)" stroke-width="1" stroke-dasharray="3 4" />
-            <path d="M448,298 L186,368" stroke="rgba(78,229,133,0.3)" stroke-width="1" stroke-dasharray="3 4" />
-          </svg>
-
-          <!-- ── zoomed macOS desktop ── -->
-          <div
-            :class="[bigdesk, D]"
-            class="left-[2px] top-0 [transform:scale(0.14)] [transform-origin:128px_420px] animate-[desk-pop_16s_cubic-bezier(0.22,1,0.36,1)_infinite] @max-[660px]:left-[28px] @max-[660px]:[transform-origin:232px_65px]"
-          >
-            <div class="flex h-[22px] items-center gap-2.5 border-b border-white/5 bg-[rgba(10,14,20,0.85)] px-3">
-              <span class="h-[9px] w-[9px] rounded-full [background:linear-gradient(180deg,#cbd5e1,#7b8a9a)]"></span>
-              <span :class="menubarItem" style="width: 1.8rem"></span>
-              <span :class="menubarItem" style="width: 1.1rem"></span>
-              <span :class="menubarItem" style="width: 1.4rem"></span>
-              <span class="ml-auto flex items-center gap-2">
-                <span :class="menubarItem" style="width: 0.8rem"></span>
-                <span class="text-[0.6rem] tracking-[0.05em] text-white/60">18:31</span>
-              </span>
-            </div>
-            <div
-              class="relative h-[270px] overflow-hidden [background:linear-gradient(135deg,#1c2c52_0%,#173a54_55%,#0f4a49_100%)] before:absolute before:inset-0 before:z-[2] before:bg-black before:opacity-0 before:content-[''] before:animate-[sel-dim_16s_infinite] before:[animation-delay:1.2s]"
-            >
-              <span :class="wpGlow"></span>
-              <div :class="dwin" class="shadow-[0_10px_24px_-8px_rgba(0,0,0,0.6)]">
-                <div :class="dwinBar"><i :class="dot1"></i><i :class="dot2"></i><i :class="dot3"></i></div>
-                <div :class="dwinBody">
-                  <span :class="dl" style="width: 55%; background: #4ee585"></span>
-                  <span :class="dl" style="width: 82%"></span>
-                  <span :class="dl" style="width: 64%"></span>
-                  <span :class="dl" style="width: 42%"></span>
-                  <span :class="dl" style="width: 72%"></span>
-                </div>
-              </div>
-              <div :class="photo"></div>
-              <div
-                :class="D"
-                class="absolute left-[165px] top-[76px] z-[3] h-0 w-0 bg-white/10 bg-no-repeat opacity-0 [background-image:repeating-linear-gradient(90deg,#fff_0_4px,transparent_4px_8px),repeating-linear-gradient(90deg,#fff_0_4px,transparent_4px_8px),repeating-linear-gradient(0deg,#fff_0_4px,transparent_4px_8px),repeating-linear-gradient(0deg,#fff_0_4px,transparent_4px_8px)] [background-position:0_0,0_100%,0_0,100%_0] [background-size:100%_1.5px,100%_1.5px,1.5px_100%,1.5px_100%] animate-[sel-grow_16s_linear_infinite,ants_0.6s_linear_infinite]"
-              ></div>
-              <div
-                :class="D"
-                class="absolute left-[165px] top-[76px] z-[4] -m-[5.5px] h-[11px] w-[11px] opacity-0 [background:linear-gradient(#fff,#fff)_center/100%_1.3px_no-repeat,linear-gradient(#fff,#fff)_center/1.3px_100%_no-repeat] [filter:drop-shadow(0_0_3px_rgba(0,0,0,0.8))] animate-[crosshair_16s_linear_infinite] motion-reduce:hidden"
-              ></div>
-              <div
-                :class="D"
-                class="pointer-events-none absolute inset-0 z-[6] bg-[#eaf6ff] opacity-0 animate-[cam-flash_16s_infinite]"
-              ></div>
-              <div class="absolute bottom-2 left-1/2 flex -translate-x-1/2 gap-1.5 rounded-lg bg-white/10 px-2 py-1">
-                <i class="h-2.5 w-2.5 rounded-[3.5px] bg-[#5aa7f7]"></i>
-                <i class="h-2.5 w-2.5 rounded-[3.5px] bg-[#4ee585]"></i>
-                <i class="h-2.5 w-2.5 rounded-[3.5px] bg-[#f7b955]"></i>
-                <i class="h-2.5 w-2.5 rounded-[3.5px] bg-[#d78bea]"></i>
-                <i class="h-2.5 w-2.5 rounded-[3.5px] bg-[#8b97a5]"></i>
-              </div>
-            </div>
-          </div>
-
-          <!-- ── debian desktop: Claude Code session ── -->
-          <div
-            :class="[bigdesk, D]"
-            class="right-[2px] top-0 [transform:scale(0.14)] [transform-origin:396px_240px] animate-[desk-pop-deb_16s_cubic-bezier(0.22,1,0.36,1)_infinite] @max-[660px]:left-[28px] @max-[660px]:right-auto @max-[660px]:top-[380px] @max-[660px]:[transform-origin:232px_440px]"
-          >
-            <div class="relative flex h-[22px] items-center border-b border-white/5 bg-[#191225] px-3">
-              <span :class="menubarItem" style="width: 1.4rem"></span>
-              <span class="absolute left-1/2 -translate-x-1/2 text-[0.6rem] tracking-[0.05em] text-white/60">18:31</span>
-              <span class="ml-auto flex gap-1.5">
-                <span class="h-[5px] w-[5px] rounded-full bg-white/30"></span>
-                <span class="h-[5px] w-[5px] rounded-full bg-white/30"></span>
-                <span class="h-[5px] w-[5px] rounded-full bg-white/30"></span>
-              </span>
-            </div>
-            <div class="relative h-[270px] overflow-hidden [background:linear-gradient(135deg,#2b1436_0%,#55204a_55%,#7c2d52_100%)]">
-              <div class="absolute left-[26px] top-[24px] w-[330px] overflow-hidden rounded-md border border-white/10 bg-[rgba(12,12,18,0.95)] shadow-[0_12px_28px_-8px_rgba(0,0,0,0.65)]">
-                <div :class="dwinBar">
-                  <i :class="dot1"></i><i :class="dot2"></i><i :class="dot3"></i>
-                  <span class="ml-1.5 text-[8px] leading-[6px] text-white/45">claude — debian</span>
-                </div>
-                <div class="flex flex-col gap-2 px-3 pb-3.5 pt-2.5 text-[9.5px] leading-[1.4]">
-                  <div class="flex items-center gap-1.5 overflow-hidden whitespace-nowrap rounded border border-white/20 px-2 py-[5px]">
-                    <span class="font-bold text-[#d97757]">&gt;</span>
-                    <span
-                      :class="D"
-                      class="inline-block w-0 overflow-hidden whitespace-nowrap align-bottom text-tuisoft animate-[cc-type_16s_infinite]"
-                    >A bit more like this</span>
-                    <span
-                      :class="D"
-                      class="-ml-1.5 max-w-0 overflow-hidden whitespace-nowrap rounded-[3px] bg-[rgba(110,168,254,0.16)] text-[8.5px] text-[#8fb8ff] opacity-0 [padding:1px_0] animate-[cc-img_16s_infinite]"
-                    >[Image #1]</span>
-                    <span
-                      class="h-[11px] w-[5px] bg-tuisoft animate-[cc-blink_0.9s_steps(1,end)_infinite,cc-cursor-gate_16s_infinite] [animation-delay:0s,1.2s]"
-                    ></span>
-                  </div>
-                  <div :class="D" class="flex items-center gap-1.5 opacity-0 animate-[cc-reveal-line_16s_infinite]">
-                    <span class="text-[8px] text-mint">⏺</span>
-                    <span class="text-tuisoft">Here's your authorization code:</span>
-                  </div>
-                  <div :class="D" class="relative self-start text-[#e6edf5] opacity-0 animate-[cc-reveal-code_16s_infinite]">
-                    <span
-                      :class="D"
-                      class="absolute -bottom-px -left-0.5 -top-px w-0 rounded-sm bg-mint/30 opacity-0 animate-[cc-hl_16s_linear_infinite]"
-                    ></span>
-                    <span class="relative z-[1] font-bold tracking-[0.04em] text-[#7ee7ab]">01923091283</span>
-                  </div>
-                </div>
-              </div>
-              <div
-                :class="D"
-                class="absolute left-[38px] top-[108px] z-[4] h-3 w-[3px] opacity-0 [background:linear-gradient(#fff,#fff)_center/1.4px_100%_no-repeat] [filter:drop-shadow(0_0_3px_rgba(0,0,0,0.9))] animate-[deb-cursor_16s_linear_infinite] before:absolute before:left-0 before:top-0 before:h-[1.4px] before:w-[3px] before:bg-white before:content-[''] after:absolute after:bottom-0 after:left-0 after:h-[1.4px] after:w-[3px] after:bg-white after:content-[''] motion-reduce:hidden"
-              ></div>
-            </div>
-          </div>
-
-          <!-- THE screenshot in flight -->
-          <div
-            :class="[flyShot, D]"
-            class="[offset-path:path('M271,169_C300,300_128,330_128,415_C180,428_270,320_330,240')] animate-[fly-main_16s_infinite] @max-[660px]:[offset-path:path('M297,169_C315,130_295,80_260,65_C260,112_260,158_260,205')]"
-          >
-            <div :class="shotInner">
-              <div :class="dwin">
-                <div :class="dwinBar"><i :class="dot1"></i><i :class="dot2"></i><i :class="dot3"></i></div>
-                <div :class="dwinBody">
-                  <span :class="dl" style="width: 55%; background: #4ee585"></span>
-                  <span :class="dl" style="width: 82%"></span>
-                  <span :class="dl" style="width: 64%"></span>
-                  <span :class="dl" style="width: 42%"></span>
-                  <span :class="dl" style="width: 72%"></span>
-                </div>
-              </div>
-              <div :class="photo"></div>
-              <span :class="wpGlow"></span>
-            </div>
-          </div>
-
-          <!-- screenshot copies fan out -->
-          <div
-            :class="[flyShot, D]"
-            class="[transform:scale(0.22)] [offset-path:path('M810,202_C850,202_900,80_942,80')] animate-[fly-out-a_16s_infinite] @max-[660px]:[offset-path:path('M260,680_C260,725_87,748_87,820')]"
-          >
-            <div :class="shotInner">
-              <div :class="dwin">
-                <div :class="dwinBar"><i :class="dot1"></i><i :class="dot2"></i><i :class="dot3"></i></div>
-                <div :class="dwinBody">
-                  <span :class="dl" style="width: 55%; background: #4ee585"></span>
-                  <span :class="dl" style="width: 82%"></span>
-                  <span :class="dl" style="width: 64%"></span>
-                </div>
-              </div>
-              <div :class="photo"></div>
-            </div>
-          </div>
-          <div
-            :class="[flyShot, D]"
-            class="[transform:scale(0.22)] [offset-path:path('M810,240_C845,228_900,252_942,240')] animate-[fly-out-b_16s_infinite] @max-[660px]:[offset-path:path('M260,680_C260,725_260,748_260,820')]"
-          >
-            <div :class="shotInner">
-              <div :class="dwin">
-                <div :class="dwinBar"><i :class="dot1"></i><i :class="dot2"></i><i :class="dot3"></i></div>
-                <div :class="dwinBody">
-                  <span :class="dl" style="width: 55%; background: #4ee585"></span>
-                  <span :class="dl" style="width: 82%"></span>
-                  <span :class="dl" style="width: 64%"></span>
-                </div>
-              </div>
-              <div :class="photo"></div>
-            </div>
-          </div>
-          <div
-            :class="[flyShot, D]"
-            class="[transform:scale(0.22)] [offset-path:path('M810,278_C850,278_900,400_942,400')] animate-[fly-out-a_16s_infinite] @max-[660px]:[offset-path:path('M260,680_C260,725_433,748_433,820')]"
-          >
-            <div :class="shotInner">
-              <div :class="dwin">
-                <div :class="dwinBar"><i :class="dot1"></i><i :class="dot2"></i><i :class="dot3"></i></div>
-                <div :class="dwinBody">
-                  <span :class="dl" style="width: 55%; background: #4ee585"></span>
-                  <span :class="dl" style="width: 82%"></span>
-                  <span :class="dl" style="width: 64%"></span>
-                </div>
-              </div>
-              <div :class="photo"></div>
-            </div>
-          </div>
-
-          <!-- THE copied code, riding the pipes -->
-          <div
-            :class="[flyText, D]"
-            class="[offset-path:path('M623,137_C760,160_948,155_948,235_C914,252_860,228_810,240')] animate-[fly-text-main_16s_infinite] @max-[660px]:[offset-path:path('M101,517_C180,630_260,720_260,818_C260,770_260,724_260,684')]"
-          >
-            <span :class="ftSent">01923091283</span>
-          </div>
-          <div
-            :class="[flyText, D]"
-            class="[transform:scale(0.42)] [offset-path:path('M330,240_C290,240_160,300_128,412')] animate-[fly-text-out-b_16s_infinite] @max-[660px]:[offset-path:path('M260,200_C260,160_260,110_260,70')]"
-          >
-            <span :class="ftSent">01923091283</span>
-          </div>
-          <div
-            :class="[flyText, D]"
-            class="[transform:scale(0.42)] [offset-path:path('M810,202_C850,202_900,80_942,80')] animate-[fly-text-out-a_16s_infinite] @max-[660px]:[offset-path:path('M260,680_C260,728_87,748_87,820')]"
-          >
-            <span :class="ftSent">01923091283</span>
-          </div>
-          <div
-            :class="[flyText, D]"
-            class="[transform:scale(0.42)] [offset-path:path('M810,278_C850,278_900,400_942,400')] animate-[fly-text-out-a_16s_infinite] @max-[660px]:[offset-path:path('M260,680_C260,728_433,748_433,820')]"
-          >
-            <span :class="ftSent">01923091283</span>
-          </div>
-
-          <!-- ── macbook card ── -->
-          <div class="grid items-end justify-items-center pb-1.5 @max-[660px]:items-center @max-[660px]:pb-0">
-            <div :class="[node, D]" class="animate-[glow-macbook_16s_infinite]">
-              <span :class="[ping, D]" class="animate-[ping-macbook_16s_ease-out_infinite]"></span>
-              <svg class="w-[76px] flex-none" viewBox="0 0 100 60">
-                <defs>
-                  <linearGradient id="alu-nb" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0" stop-color="#3b485c" />
-                    <stop offset="1" stop-color="#212b39" />
-                  </linearGradient>
-                  <linearGradient id="wall-nb" x1="0" y1="0" x2="1" y2="1">
-                    <stop offset="0" stop-color="#1c2c52" />
-                    <stop offset="0.55" stop-color="#173a54" />
-                    <stop offset="1" stop-color="#0f4a49" />
-                  </linearGradient>
-                </defs>
-                <rect x="24" y="4" width="52" height="36" rx="3" fill="#0a0e14" stroke="#3d4c60" stroke-width="1.2" />
-                <rect x="27" y="7" width="46" height="30" rx="1.5" fill="url(#wall-nb)" />
-                <rect x="30" y="10" width="18" height="10" rx="1.5" fill="rgba(10,15,22,0.92)" />
-                <path d="M32 13h9M32 15.5h6.5M32 18h8" stroke="#4ee585" stroke-width="1" stroke-linecap="round" opacity="0.7" />
-                <path d="M14 44 h72 l4.5 7 a2.5 2.5 0 0 1 -2.4 3.2 H12 a2.5 2.5 0 0 1 -2.4 -3.2 z" fill="url(#alu-nb)" />
-                <rect x="42" y="44" width="16" height="2.4" rx="1.2" fill="#18212d" />
-              </svg>
-              <div class="flex flex-col items-center text-center">
-                <span :class="mname">macbook</span>
-                <span :class="mos">pasteboard</span>
-              </div>
-            </div>
-          </div>
-
-          <!-- ── wire: macbook ⇄ monitor ── -->
-          <svg class="h-full w-full overflow-visible" viewBox="0 0 72 480" preserveAspectRatio="none">
-            <path
-              :class="wire"
-              class="@max-[660px]:[d:path('M36,-90_C36,160_36,320_36,480')]"
-              d="M-58,420 C10,420 30,240 70,240"
-            />
-          </svg>
-
-          <!-- ── the monitor ── -->
-          <div
-            class="flex min-w-0 flex-col overflow-hidden rounded-xl border border-white/9 bg-tuibg shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_40px_90px_-30px_rgba(0,0,0,0.85),0_25px_70px_-35px_rgba(78,229,133,0.22)] @max-[660px]:w-[500px] @max-[660px]:justify-self-center"
-          >
-            <div class="relative flex h-[2.1rem] flex-none items-center border-b border-black/55 px-3.5 [background:linear-gradient(180deg,#1b212c,#161c25)]">
-              <span class="flex gap-2">
-                <i class="h-3 w-3 rounded-full bg-[#ff5f57] shadow-[inset_0_0_1px_rgba(0,0,0,0.35)]"></i>
-                <i class="h-3 w-3 rounded-full bg-[#febc2e] shadow-[inset_0_0_1px_rgba(0,0,0,0.35)]"></i>
-                <i class="h-3 w-3 rounded-full bg-[#28c840] shadow-[inset_0_0_1px_rgba(0,0,0,0.35)]"></i>
-              </span>
-              <span class="absolute left-1/2 -translate-x-1/2 text-[0.75rem] font-semibold tracking-[0.01em] text-[#8b97a5]">ssh-clipboard monitor</span>
-            </div>
-            <div class="flex min-h-0 flex-1 flex-col gap-3.5 px-3.5 pb-2.5 pt-3.5 text-[0.7rem] leading-[1.5]">
-              <div class="text-center leading-[1.4]">
-                <div>
-                  <span class="font-bold text-tuiaccent">ssh</span><span :class="soft"> ◇ </span><span class="font-bold text-tuiaccent">clipboard</span>
-                  <span class="inline-block w-[1.2em]"></span>
-                  <span class="font-bold text-tuigreen animate-[live-pulse_2.4s_ease-in-out_infinite]">● LIVE</span>
-                </div>
-                <div class="text-[0.65rem] text-tuimuted">native clipboard&nbsp; •&nbsp; persistent SSH&nbsp; •&nbsp; zero cloud hops</div>
-              </div>
-
-              <div :class="panel">
-                <span :class="panelTitle">Peers</span>
-                <div class="flex flex-wrap gap-x-3 gap-y-0.5 whitespace-nowrap">
-                  <span><i class="not-italic text-tuigreen">●</i> <b :class="peerB">macbook</b> <span :class="muted">this machine</span></span>
-                  <span :class="sep">│</span>
-                  <span><i class="not-italic text-tuigreen">●</i> <b :class="peerB">debian</b> <span :class="muted">connected · v0.2.1</span></span>
-                  <span :class="sep">│</span>
-                  <span><i class="not-italic text-tuigreen">●</i> <b :class="peerB">fedora</b> <span :class="muted">connected · v0.2.1</span></span>
-                  <span :class="sep">│</span>
-                  <span><i class="not-italic text-tuiyellow">●</i> <b :class="peerB">mini</b> <span class="text-tuiyellow">outdated · 0.2.0</span></span>
-                </div>
-                <div class="mt-1.5 flex flex-wrap gap-x-2 whitespace-nowrap">
-                  <span :class="muted">backend</span> <span :class="soft">NSPasteboard</span>
-                  <span :class="muted" class="ml-2">version</span> <span :class="soft">0.2.1</span>
-                  <span :class="muted" class="ml-2">sent</span>
-                  <span :class="[soft, D]" class="opacity-0 animate-[show-at-28_16s_infinite]">26.4 MiB</span>
-                  <span :class="muted" class="ml-2">received</span>
-                  <span :class="[soft, D]" class="opacity-0 animate-[show-at-69_16s_infinite]">11 B</span>
-                </div>
-              </div>
-
-              <div :class="panel" class="flex min-h-0 flex-1 flex-col">
-                <span :class="panelTitle">Clipboard activity</span>
-                <div class="flex flex-col overflow-hidden tabular-nums">
-                  <div :class="rowGrid" class="mb-1.5 text-[0.62rem] font-bold tracking-[0.06em] text-tuimuted">
-                    <span>TIME</span><span>FLOW</span><span>CONTENT</span><span class="text-right">SIZE</span><span class="text-right">FORMATS</span>
-                  </div>
-                  <div :class="[trow, D]" class="animate-[type-t3_16s_infinite]">
-                    <span :class="muted">47.218</span>
-                    <span class="font-bold text-tuicyan">→ macbook</span>
-                    <span :class="cellPv">01923091283</span>
-                    <span :class="num">11 B</span>
-                    <span :class="num">1</span>
-                  </div>
-                  <div :class="[trow, D]" class="animate-[type-t2_16s_infinite]">
-                    <span :class="muted">47.217</span>
-                    <span class="font-bold text-tuicyan">→ mini</span>
-                    <span :class="cellPv">01923091283</span>
-                    <span :class="num">11 B</span>
-                    <span :class="num">1</span>
-                  </div>
-                  <div :class="[trow, D]" class="animate-[type-t1_16s_infinite]">
-                    <span :class="muted">47.216</span>
-                    <span class="font-bold text-tuicyan">→ fedora</span>
-                    <span :class="cellPv">01923091283</span>
-                    <span :class="num">11 B</span>
-                    <span :class="num">1</span>
-                  </div>
-                  <div :class="[trow, D]" class="animate-[type-recv_16s_infinite]">
-                    <span :class="muted">47.214</span>
-                    <span class="font-bold text-tuigreen">← debian</span>
-                    <span :class="cellPv">01923091283</span>
-                    <span :class="num">11 B</span>
-                    <span :class="num">1</span>
-                  </div>
-                  <div :class="[trow, D]" class="animate-[type-s3_16s_infinite]">
-                    <span :class="muted">41.532</span>
-                    <span class="font-bold text-tuicyan">→ mini</span>
-                    <span :class="cellPv">&lt;Apple PNG past…</span>
-                    <span :class="num">8.8 MiB</span>
-                    <span :class="num">6</span>
-                  </div>
-                  <div :class="[trow, D]" class="animate-[type-s2_16s_infinite]">
-                    <span :class="muted">41.531</span>
-                    <span class="font-bold text-tuicyan">→ debian</span>
-                    <span :class="cellPv">&lt;Apple PNG past…</span>
-                    <span :class="num">8.8 MiB</span>
-                    <span :class="num">6</span>
-                  </div>
-                  <div :class="[trow, D]" class="animate-[type-s1_16s_infinite]">
-                    <span :class="muted">41.530</span>
-                    <span class="font-bold text-tuicyan">→ fedora</span>
-                    <span :class="cellPv">&lt;Apple PNG past…</span>
-                    <span :class="num">8.8 MiB</span>
-                    <span :class="num">6</span>
-                  </div>
-                  <div :class="[trow, D]" class="animate-[type-local_16s_infinite]">
-                    <span :class="muted">41.204</span>
-                    <span class="font-bold text-tuiaccent">◆ copied here</span>
-                    <span :class="cellPv">&lt;Apple PNG past…</span>
-                    <span :class="num">8.8 MiB</span>
-                    <span :class="num">6</span>
-                  </div>
-                </div>
-              </div>
-
-              <div class="flex-none text-center text-[0.65rem]">
-                <span class="font-bold text-tuicyan">p</span><span :class="muted"> pause&nbsp; •&nbsp; </span><span class="font-bold text-tuicyan">c</span><span :class="muted"> clear&nbsp; •&nbsp; </span><span class="font-bold text-tuicyan">q</span><span :class="muted"> close</span>
-              </div>
-            </div>
-          </div>
-
-          <!-- ── wires: monitor ⇄ 3 machines ── -->
-          <svg class="h-full w-full overflow-visible" viewBox="0 0 72 480" preserveAspectRatio="none">
-            <path
-              :class="wire"
-              class="@max-[660px]:[d:path('M36,0_C36,250_12,250_12,630')]"
-              d="M2,202 C40,202 30,80 70,80"
-            />
-            <path
-              :class="wire"
-              class="@max-[660px]:[d:path('M36,0_C36,250_36,250_36,630')]"
-              d="M2,240 C34,228 38,252 70,240"
-            />
-            <path
-              :class="wire"
-              class="@max-[660px]:[d:path('M36,0_C36,250_60,250_60,630')]"
-              d="M2,278 C40,278 30,400 70,400"
-            />
-          </svg>
-
-          <!-- ── receiving machines ── -->
-          <div class="grid grid-rows-3 items-center justify-items-center @max-[660px]:grid-cols-3 @max-[660px]:grid-rows-none">
-            <div :class="[node, D]" class="animate-[glow-recv-both_16s_infinite]">
-              <span :class="[ping, D]" class="animate-[ping-recv_16s_ease-out_infinite]"></span>
-              <svg class="w-[76px] flex-none" viewBox="0 0 100 60">
-                <defs>
-                  <linearGradient id="case-fed" x1="0" y1="0" x2="1" y2="0">
-                    <stop offset="0" stop-color="#2d3949" />
-                    <stop offset="1" stop-color="#19222e" />
-                  </linearGradient>
-                </defs>
-                <ellipse cx="50" cy="56" rx="22" ry="2.4" fill="rgba(0,0,0,0.45)" />
-                <rect x="34" y="3" width="32" height="52" rx="3.5" fill="url(#case-fed)" stroke="#46566c" stroke-width="1" />
-                <path :d="tower" stroke="#141d28" stroke-width="1.7" stroke-linecap="round" />
-                <rect x="39" y="23" width="22" height="3" rx="1.5" fill="#141d28" />
-                <rect :class="D" class="animate-[led-recv_16s_infinite]" x="39" y="31" width="2.6" height="15" rx="1.3" fill="#4ee585" />
-                <circle class="animate-[led-idle_3.1s_ease-in-out_infinite]" cx="58" cy="47" r="2.7" fill="none" stroke="#4ee585" stroke-width="1.1" />
-              </svg>
-              <div class="flex flex-col items-center text-center">
-                <span :class="mname">fedora</span>
-                <span :class="mos">wayland</span>
-              </div>
-            </div>
-            <div :class="[node, D]" class="animate-[glow-send-b_16s_infinite]">
-              <span :class="[ping, D]" class="animate-[ping-send-b_16s_ease-out_infinite]"></span>
-              <svg class="w-[76px] flex-none" viewBox="0 0 100 60">
-                <defs>
-                  <linearGradient id="case-deb" x1="0" y1="0" x2="1" y2="0">
-                    <stop offset="0" stop-color="#2d3949" />
-                    <stop offset="1" stop-color="#19222e" />
-                  </linearGradient>
-                </defs>
-                <ellipse cx="50" cy="56" rx="22" ry="2.4" fill="rgba(0,0,0,0.45)" />
-                <rect x="34" y="3" width="32" height="52" rx="3.5" fill="url(#case-deb)" stroke="#46566c" stroke-width="1" />
-                <path :d="tower" stroke="#141d28" stroke-width="1.7" stroke-linecap="round" />
-                <rect x="39" y="23" width="22" height="3" rx="1.5" fill="#141d28" />
-                <rect :class="D" class="animate-[led-send-b_16s_infinite]" x="39" y="31" width="2.6" height="15" rx="1.3" fill="#4ee585" />
-                <circle class="animate-[led-idle_3.1s_ease-in-out_infinite]" cx="58" cy="47" r="2.7" fill="none" stroke="#4ee585" stroke-width="1.1" />
-              </svg>
-              <div class="flex flex-col items-center text-center">
-                <span :class="mname">debian</span>
-                <span :class="mos">x11</span>
-              </div>
-            </div>
-            <div :class="[node, D]" class="animate-[glow-recv-both_16s_infinite]">
-              <span :class="[ping, D]" class="animate-[ping-recv_16s_ease-out_infinite]"></span>
-              <svg class="w-[76px] flex-none" viewBox="0 0 100 60">
-                <defs>
-                  <linearGradient id="alu-mini" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0" stop-color="#3b485c" />
-                    <stop offset="1" stop-color="#212b39" />
-                  </linearGradient>
-                </defs>
-                <ellipse cx="50" cy="45" rx="28" ry="2.6" fill="rgba(0,0,0,0.45)" />
-                <rect x="22" y="16" width="56" height="26" rx="6" fill="url(#alu-mini)" stroke="#46566c" stroke-width="1" />
-                <rect x="24" y="17.4" width="52" height="2" rx="1" fill="rgba(255,255,255,0.1)" />
-                <circle cx="50" cy="29" r="6" fill="none" stroke="#1c2734" stroke-width="1.5" />
-                <rect x="30" y="36" width="12" height="1.6" rx="0.8" fill="#1b2634" />
-                <circle :class="D" class="animate-[led-recv_16s_infinite]" cx="70" cy="36" r="1.9" fill="#4ee585" />
-              </svg>
-              <div class="flex flex-col items-center text-center">
-                <span :class="mname">mini</span>
-                <span :class="mos">pasteboard</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
+  <div ref="wrap" class="w-full" aria-hidden="true">
+    <canvas ref="cv" class="block w-full"></canvas>
   </div>
 </template>
