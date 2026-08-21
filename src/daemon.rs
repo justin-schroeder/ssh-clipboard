@@ -256,9 +256,23 @@ impl Daemon {
             established.store(true, Ordering::Release);
         }
 
+        let (read_stop, mut read_stop_rx) = watch::channel(false);
         let read_loop = async {
             loop {
-                match read_message(reader, self.config.max_bytes).await {
+                if *read_stop_rx.borrow() {
+                    break Ok(());
+                }
+                let incoming = tokio::select! {
+                    biased;
+                    changed = read_stop_rx.changed() => {
+                        if changed.is_err() || *read_stop_rx.borrow() {
+                            break Ok(());
+                        }
+                        continue;
+                    }
+                    incoming = read_message(reader, self.config.max_bytes) => incoming,
+                };
+                match incoming {
                     Ok(Message::Clip(clip)) => {
                         self.receive_clip(Arc::new(clip), &node_name, connection_id).await;
                     }
@@ -318,10 +332,20 @@ impl Daemon {
                 }
             }
         };
+        tokio::pin!(read_loop);
+        tokio::pin!(write_loop);
+        tokio::pin!(shutdown_loop);
         let result = tokio::select! {
-            result = read_loop => result,
-            result = write_loop => result,
-            () = shutdown_loop => Ok(()),
+            result = &mut read_loop => result,
+            result = &mut write_loop => {
+                read_stop.send_replace(true);
+                result.and(read_loop.await)
+            },
+            () = &mut shutdown_loop => {
+                read_stop.send_replace(true);
+                let _ = read_loop.await;
+                Ok(())
+            },
         };
         self.peers.write().await.remove(&connection_id);
         info!(peer = %node_name, "peer disconnected");
@@ -803,6 +827,12 @@ mod tests {
         released: bool,
     }
 
+    struct FailingWriter<W> {
+        inner: W,
+        armed: Arc<AtomicBool>,
+        failed: Option<oneshot::Sender<()>>,
+    }
+
     impl<W> GatedWriter<W> {
         fn new(inner: W, armed: Arc<AtomicBool>, gate: Arc<Barrier>) -> Self {
             Self {
@@ -811,6 +841,16 @@ mod tests {
                 gate,
                 waiting: None,
                 released: false,
+            }
+        }
+    }
+
+    impl<W> FailingWriter<W> {
+        fn new(inner: W, armed: Arc<AtomicBool>, failed: oneshot::Sender<()>) -> Self {
+            Self {
+                inner,
+                armed,
+                failed: Some(failed),
             }
         }
     }
@@ -841,6 +881,34 @@ mod tests {
                 }
                 this.waiting = None;
                 this.released = true;
+            }
+            Pin::new(&mut this.inner).poll_write(context, buffer)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+        }
+    }
+
+    impl<W> AsyncWrite for FailingWriter<W>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if this.armed.load(Ordering::Acquire) {
+                if let Some(failed) = this.failed.take() {
+                    let _ = failed.send(());
+                }
+                return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
             }
             Pin::new(&mut this.inner).poll_write(context, buffer)
         }
@@ -1323,6 +1391,102 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_failure_waits_for_active_clipboard_apply() {
+        let config = Config {
+            node_name: "local".into(),
+            ..Config::default()
+        };
+        let (clipboard, apply_started) = BlockingClipboard::new(BlockingOperation::Apply);
+        let daemon = Daemon::new(config.clone(), clipboard.clone());
+        let (peer, server) = duplex(16 * 1024);
+        let (mut peer_reader, mut peer_writer) = split(peer);
+        let (mut server_reader, server_writer) = split(server);
+        let armed = Arc::new(AtomicBool::new(false));
+        let (failed_tx, failed_rx) = oneshot::channel();
+        let mut server_writer = FailingWriter::new(server_writer, Arc::clone(&armed), failed_tx);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let serving_daemon = Arc::clone(&daemon);
+        let mut session = tokio::spawn(async move {
+            serving_daemon
+                .serve_peer(
+                    &mut server_reader,
+                    &mut server_writer,
+                    "remote",
+                    shutdown_rx,
+                    None,
+                )
+                .await
+        });
+        assert!(matches!(
+            read_message(&mut peer_reader, config.max_bytes).await.unwrap(),
+            Message::Hello { .. }
+        ));
+        write_message(
+            &mut peer_writer,
+            &Message::Hello {
+                node_id: Uuid::new_v4(),
+                node_name: "remote".into(),
+                machine_name: Some("remote.local".into()),
+                app_version: Some(CURRENT_VERSION.into()),
+                desired_version: Some(CURRENT_VERSION.into()),
+            },
+            config.max_bytes,
+        )
+        .await
+        .unwrap();
+        let remote_clip = Clip::new(
+            Uuid::new_v4(),
+            vec![Representation {
+                item: 0,
+                format: "text/plain".into(),
+                data: b"remote".to_vec(),
+            }],
+        );
+        let expected = Snapshot::new(remote_clip.representations.clone()).fingerprint;
+        write_clip(&mut peer_writer, &remote_clip, config.max_bytes)
+            .await
+            .unwrap();
+        timeout(Duration::from_millis(500), apply_started)
+            .await
+            .unwrap()
+            .unwrap();
+
+        armed.store(true, Ordering::Release);
+        daemon
+            .broadcast_clip(
+                Arc::new(Clip::new(
+                    config.node_id,
+                    vec![Representation {
+                        item: 0,
+                        format: "text/plain".into(),
+                        data: b"local".to_vec(),
+                    }],
+                )),
+                None,
+            )
+            .await;
+        timeout(Duration::from_millis(500), failed_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(timeout(Duration::from_millis(100), &mut session).await.is_err());
+        assert!(daemon.apply_lock.try_lock().is_err());
+        assert_eq!(*daemon.last_clipboard.lock().await, None);
+        assert_eq!(*daemon.suppressed.lock().await, None);
+
+        clipboard.release();
+        let result = timeout(Duration::from_millis(500), &mut session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        assert_eq!(*daemon.last_clipboard.lock().await, Some(expected));
+        assert_eq!(*daemon.suppressed.lock().await, Some(expected));
+        assert!(daemon.apply_lock.try_lock().is_ok());
     }
 
     #[tokio::test(flavor = "current_thread")]
