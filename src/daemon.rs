@@ -22,7 +22,35 @@ use crate::protocol::{Message, read_message, write_clip, write_message};
 use crate::ssh;
 use crate::update::{self, CURRENT_VERSION};
 
-const WATCHER_STARTUP_RECONCILE_DELAY: Duration = Duration::from_secs(1);
+const WATCHER_RECONCILE_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const WATCHER_RECONCILE_MAX_DELAY: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy)]
+struct WatcherReconcile {
+    deadline: tokio::time::Instant,
+    delay: Duration,
+}
+
+impl WatcherReconcile {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            deadline: now + WATCHER_RECONCILE_INITIAL_DELAY,
+            delay: WATCHER_RECONCILE_INITIAL_DELAY,
+        }
+    }
+
+    fn retry(&mut self, now: tokio::time::Instant) {
+        self.delay = self.delay.saturating_mul(2).min(WATCHER_RECONCILE_MAX_DELAY);
+        self.deadline = now + self.delay;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipboardWake {
+    Native,
+    Reconcile,
+    Poll,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerStatus {
@@ -128,14 +156,20 @@ impl Daemon {
             *self.last_clipboard.lock().await = initial.map(|snapshot| snapshot.fingerprint);
         }
         interval.reset();
-        let mut startup_reconcile = changes
+        let mut watcher_reconcile = changes
             .as_ref()
-            .map(|_| tokio::time::Instant::now() + WATCHER_STARTUP_RECONCILE_DELAY);
+            .map(|_| WatcherReconcile::new(tokio::time::Instant::now()));
         loop {
             tokio::select! {
-                () = next_clipboard_change(&mut changes, &mut interval, &mut startup_reconcile) => {
+                wake = next_clipboard_change(&mut changes, &mut interval, &mut watcher_reconcile) => {
                     let _guard = self.apply_lock.lock().await;
-                    let snapshot = match self.capture_clipboard().await {
+                    let snapshot = self.capture_clipboard().await;
+                    if wake == ClipboardWake::Reconcile
+                        && let Some(reconcile) = &mut watcher_reconcile
+                    {
+                        reconcile.retry(tokio::time::Instant::now());
+                    }
+                    let snapshot = match snapshot {
                         Ok(Some(snapshot)) => snapshot,
                         Ok(None) => continue,
                         Err(error) => {
@@ -415,27 +449,29 @@ impl Daemon {
 async fn next_clipboard_change(
     changes: &mut Option<ChangeReceiver>,
     interval: &mut tokio::time::Interval,
-    startup_reconcile: &mut Option<tokio::time::Instant>,
-) {
+    watcher_reconcile: &mut Option<WatcherReconcile>,
+) -> ClipboardWake {
     if let Some(receiver) = changes {
-        let change = if let Some(deadline) = *startup_reconcile {
+        let change = if let Some(reconcile) = watcher_reconcile.as_ref() {
             tokio::select! {
                 change = receiver.recv() => change,
-                () = tokio::time::sleep_until(deadline) => {
-                    *startup_reconcile = None;
-                    return;
+                () = tokio::time::sleep_until(reconcile.deadline) => {
+                    return ClipboardWake::Reconcile;
                 }
             }
         } else {
             receiver.recv().await
         };
         if change.is_some() {
-            return;
+            *watcher_reconcile = None;
+            return ClipboardWake::Native;
         }
         *changes = None;
+        *watcher_reconcile = None;
         interval.reset();
     }
     interval.tick().await;
+    ClipboardWake::Poll
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -1256,6 +1292,66 @@ mod tests {
         daemon.receive_clip(remote, "remote", Uuid::new_v4()).await;
 
         assert!(daemon.record_clipboard_fingerprint(local.fingerprint).await);
+    }
+
+    #[test]
+    fn watcher_reconciliation_retries_with_bounded_backoff() {
+        let mut now = tokio::time::Instant::now();
+        let mut reconcile = WatcherReconcile::new(now);
+        assert_eq!(reconcile.deadline.duration_since(now), Duration::from_secs(1));
+
+        for expected in [2, 4, 8, 16, 30, 30] {
+            now = reconcile.deadline;
+            reconcile.retry(now);
+            assert_eq!(reconcile.delay, Duration::from_secs(expected));
+            assert_eq!(
+                reconcile.deadline.duration_since(now),
+                Duration::from_secs(expected)
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watcher_reconciliation_continues_until_native_event() {
+        let (sender, receiver) = mpsc::channel(1);
+        let mut changes = Some(ChangeReceiver::for_test(receiver));
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let mut reconcile = Some(WatcherReconcile::new(tokio::time::Instant::now()));
+
+        assert_eq!(
+            next_clipboard_change(&mut changes, &mut interval, &mut reconcile).await,
+            ClipboardWake::Reconcile
+        );
+        tokio::time::advance(Duration::from_secs(5)).await;
+        reconcile.as_mut().unwrap().retry(tokio::time::Instant::now());
+        assert_eq!(
+            reconcile
+                .as_ref()
+                .unwrap()
+                .deadline
+                .duration_since(tokio::time::Instant::now()),
+            Duration::from_secs(2)
+        );
+
+        assert_eq!(
+            next_clipboard_change(&mut changes, &mut interval, &mut reconcile).await,
+            ClipboardWake::Reconcile
+        );
+        reconcile.as_mut().unwrap().retry(tokio::time::Instant::now());
+        sender.try_send(()).unwrap();
+        assert_eq!(
+            next_clipboard_change(&mut changes, &mut interval, &mut reconcile).await,
+            ClipboardWake::Native
+        );
+        assert!(reconcile.is_none());
+        assert!(
+            timeout(
+                Duration::from_secs(31),
+                next_clipboard_change(&mut changes, &mut interval, &mut reconcile)
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[test]

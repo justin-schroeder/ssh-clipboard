@@ -49,14 +49,25 @@ pub trait ClipboardBackend: Send + Sync {
 pub struct ChangeReceiver {
     receiver: tokio::sync::mpsc::Receiver<()>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    _shutdown: clipboard_rs::WatcherShutdown,
+    _shutdown: Option<clipboard_rs::WatcherShutdown>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    _thread: std::thread::JoinHandle<()>,
+    _thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ChangeReceiver {
     pub async fn recv(&mut self) -> Option<()> {
         self.receiver.recv().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(receiver: tokio::sync::mpsc::Receiver<()>) -> Self {
+        Self {
+            receiver,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            _shutdown: None,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            _thread: None,
+        }
     }
 }
 
@@ -309,8 +320,8 @@ impl ClipboardBackend for NativeClipboard {
             .ok()?;
         Some(ChangeReceiver {
             receiver,
-            _shutdown: shutdown,
-            _thread: thread,
+            _shutdown: Some(shutdown),
+            _thread: Some(thread),
         })
     }
 }
