@@ -41,8 +41,22 @@ pub trait ClipboardBackend: Send + Sync {
     fn apply(&self, representations: &[Representation]) -> Result<Snapshot>;
     fn name(&self) -> &'static str;
 
-    fn change_receiver(&self, _interval: Duration) -> Option<tokio::sync::mpsc::Receiver<()>> {
+    fn change_receiver(&self, _interval: Duration) -> Option<ChangeReceiver> {
         None
+    }
+}
+
+pub struct ChangeReceiver {
+    receiver: tokio::sync::mpsc::Receiver<()>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    _shutdown: clipboard_rs::WatcherShutdown,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    _thread: std::thread::JoinHandle<()>,
+}
+
+impl ChangeReceiver {
+    pub async fn recv(&mut self) -> Option<()> {
+        self.receiver.recv().await
     }
 }
 
@@ -276,7 +290,7 @@ impl ClipboardBackend for NativeClipboard {
         };
     }
 
-    fn change_receiver(&self, interval: Duration) -> Option<tokio::sync::mpsc::Receiver<()>> {
+    fn change_receiver(&self, interval: Duration) -> Option<ChangeReceiver> {
         #[cfg(target_os = "linux")]
         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
             // clipboard-rs' current Wayland watcher compares text and MIME names,
@@ -288,11 +302,16 @@ impl ClipboardBackend for NativeClipboard {
         let mut watcher =
             run_native_operation(|| ClipboardWatcherContext::new_with_interval(interval)).ok()?;
         watcher.add_handler(ChangeHandler(sender));
-        std::thread::Builder::new()
+        let shutdown = watcher.get_shutdown_channel();
+        let thread = std::thread::Builder::new()
             .name("ssh-clipboard-watcher".into())
             .spawn(move || watcher.start_watch())
             .ok()?;
-        Some(receiver)
+        Some(ChangeReceiver {
+            receiver,
+            _shutdown: shutdown,
+            _thread: thread,
+        })
     }
 }
 

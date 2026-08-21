@@ -14,7 +14,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::clipboard::{ClipboardBackend, NativeClipboard, Snapshot};
+use crate::clipboard::{ChangeReceiver, ClipboardBackend, NativeClipboard, Snapshot};
 use crate::config::{Config, PeerConfig, detected_machine_name, ensure_private_dir, paths};
 use crate::filebundle;
 use crate::model::{Clip, Direction, MonitorEvent};
@@ -414,10 +414,7 @@ impl Daemon {
     }
 }
 
-async fn next_clipboard_change(
-    changes: &mut Option<tokio::sync::mpsc::Receiver<()>>,
-    interval: &mut tokio::time::Interval,
-) {
+async fn next_clipboard_change(changes: &mut Option<ChangeReceiver>, interval: &mut tokio::time::Interval) {
     if let Some(receiver) = changes {
         let change = tokio::select! {
             change = receiver.recv() => change,
