@@ -40,7 +40,7 @@ async function copy() {
 </script>
 
 <template>
-  <div class="group relative my-5 overflow-hidden border border-line bg-panel">
+  <div class="group relative my-8 overflow-hidden border border-line bg-panel">
     <button
       v-if="copyable"
       class="absolute right-2 top-2 cursor-pointer bg-panel px-1 py-0.5 font-mono text-xs text-dim opacity-0 transition-[opacity,color] duration-150 group-hover:opacity-100 focus-visible:opacity-100 hover:text-mint"
@@ -48,7 +48,7 @@ async function copy() {
       :aria-label="copied ? 'Copied' : 'Copy to clipboard'"
       @click="copy"
     >{{ copied ? '[ copied ✓ ]' : '[ copy ]' }}</button>
-    <pre class="overflow-x-auto px-5 py-4 leading-[1.65]"><code class="whitespace-pre border-0 bg-transparent p-0 text-[0.95em]"><template v-for="(line, i) in lines" :key="i"><span :class="kindClass[line.kind]"><span v-if="line.kind === 'cmd'" class="select-none text-mint">$ </span>{{ line.text }}</span>
+    <pre class="overflow-x-auto px-6 py-5 leading-[1.7]"><code class="whitespace-pre border-0 bg-transparent p-0 text-[0.95em]"><template v-for="(line, i) in lines" :key="i"><span :class="kindClass[line.kind]"><span v-if="line.kind === 'cmd'" class="select-none text-mint">$ </span>{{ line.text }}</span>
 </template></code></pre>
   </div>
 </template>

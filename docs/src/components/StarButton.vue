@@ -40,12 +40,12 @@ const label = computed(() => {
 
 <template>
   <a
-    class="group inline-flex items-center gap-1.5 border border-linebright bg-raised px-2.5 py-1 text-[0.85rem] leading-[1.4] text-dim transition-colors hover:border-mintdim hover:text-mint"
+    class="group inline-flex items-center gap-1.5 border border-linebright bg-raised px-3 py-1.5 text-[0.85rem] leading-[1.4] text-ink transition-colors hover:border-mintdim hover:text-mint"
     href="https://github.com/standardagents/ssh-clipboard"
     aria-label="Star ssh-clipboard on GitHub"
   >
     <svg
-      class="h-[0.85em] w-[0.85em] transition-colors group-hover:text-amberish"
+      class="h-[0.85em] w-[0.85em] transition-colors group-hover:text-mint"
       viewBox="0 0 16 16"
       fill="currentColor"
       aria-hidden="true"

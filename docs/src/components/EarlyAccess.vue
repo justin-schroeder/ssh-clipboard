@@ -7,7 +7,7 @@ const state = ref('idle') // idle | sending | done | error
 const errorMsg = ref('')
 
 const inputClass =
-  'min-w-0 border border-[#262a40] bg-[#0a0c12] px-3.5 py-2.5 font-mono text-[0.88rem] text-bright transition-colors placeholder:text-faint focus:border-eaviolet focus:outline-none'
+  'min-w-0 border border-line bg-bg px-3.5 py-2.5 font-mono text-[0.88rem] text-bright transition-colors placeholder:text-faint focus:border-mint focus:outline-none'
 
 async function submit() {
   if (!name.value.trim() || !email.value.trim()) return
@@ -32,7 +32,7 @@ async function submit() {
 </script>
 
 <template>
-  <section class="mt-14 border border-[#23263a] bg-eabg p-6">
+  <section class="mt-20 border border-line bg-panel p-8">
     <div class="mb-3.5 flex items-center gap-3">
       <span class="inline-flex text-bright">
         <svg class="h-[22px] w-[22px]" viewBox="0 0 150 150" fill="currentColor" aria-hidden="true">
@@ -40,16 +40,17 @@ async function submit() {
         </svg>
       </span>
       <span class="text-[1.02rem] font-bold tracking-[-0.01em] text-bright">StandardAgents</span>
-      <span class="text-[0.72rem] tracking-[0.14em] text-eaviolet">[ early access ]</span>
+      <span class="text-[0.72rem] tracking-[0.14em] text-mint">[ early access ]</span>
     </div>
     <p class="mb-5 max-w-[52rem] text-[0.92rem] leading-[1.7] text-dim">
       Standard Agents is an open standard for creating domain-specific agents you can
       distribute and compose. It comes from the team behind
-      <a class="border-b border-linebright text-ink transition-colors hover:border-eaviolet hover:text-eaviolet" href="https://formkit.com">FormKit</a>,
-      <a class="border-b border-linebright text-ink transition-colors hover:border-eaviolet hover:text-eaviolet" href="https://tempo.formkit.com">Tempo</a>,
-      <a class="border-b border-linebright text-ink transition-colors hover:border-eaviolet hover:text-eaviolet" href="https://dmux.ai">dmux</a>,
-      <a class="border-b border-linebright text-ink transition-colors hover:border-eaviolet hover:text-eaviolet" href="https://auto-animate.formkit.com">AutoAnimate</a>, and
-      <a class="border-b border-linebright text-ink transition-colors hover:border-eaviolet hover:text-eaviolet" href="https://drag-and-drop.formkit.com">Drag and Drop</a>.
+      <a class="border-b border-linebright text-ink transition-colors hover:border-mint hover:text-mint" href="https://formkit.com">FormKit</a>,
+      <a class="border-b border-linebright text-ink transition-colors hover:border-mint hover:text-mint" href="https://tempo.formkit.com">Tempo</a>,
+      <a class="border-b border-linebright text-ink transition-colors hover:border-mint hover:text-mint" href="https://dmux.ai">dmux</a>,
+      <a class="border-b border-linebright text-ink transition-colors hover:border-mint hover:text-mint" href="https://arrow-js.com">ArrowJS</a>,
+      <a class="border-b border-linebright text-ink transition-colors hover:border-mint hover:text-mint" href="https://auto-animate.formkit.com">AutoAnimate</a>, and
+      <a class="border-b border-linebright text-ink transition-colors hover:border-mint hover:text-mint" href="https://drag-and-drop.formkit.com">Drag and Drop</a>.
       Join the early access waitlist below.
     </p>
     <form
@@ -60,14 +61,14 @@ async function submit() {
       <input v-model="name" :class="inputClass" type="text" placeholder="Name" autocomplete="name" required />
       <input v-model="email" :class="inputClass" type="email" placeholder="Email" autocomplete="email" required />
       <button
-        class="cursor-pointer whitespace-nowrap border border-[#6a6ef2] bg-[#5b5ee8] px-4.5 py-2.5 font-mono text-[0.88rem] font-bold text-white transition-[filter] duration-150 hover:brightness-112 disabled:cursor-default disabled:opacity-60"
+        class="cursor-pointer whitespace-nowrap border border-mint bg-transparent px-4.5 py-2.5 font-mono text-[0.88rem] font-bold text-mint transition-colors duration-150 hover:bg-mint hover:text-black disabled:cursor-default disabled:opacity-60"
         type="submit"
         :disabled="state === 'sending'"
       >
-        {{ state === 'sending' ? 'Sending…' : 'Request Early Access' }}
+        {{ state === 'sending' ? 'Sending…' : '[ Request Early Access ]' }}
       </button>
     </form>
     <p v-else class="text-[0.92rem] text-mint">✓ You're on the list. We'll be in touch.</p>
-    <p v-if="state === 'error'" class="mt-2.5 text-[0.8rem] text-[#fb7185]">{{ errorMsg }}</p>
+    <p v-if="state === 'error'" class="mt-2.5 text-[0.8rem] text-bright">✗ {{ errorMsg }}</p>
   </section>
 </template>

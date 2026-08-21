@@ -20,7 +20,6 @@ async function copy() {
     >
       <span class="font-bold text-mint">$</span>
       <span class="whitespace-nowrap">npm i -g ssh-clipboard</span>
-      <span class="h-[1.15em] w-[0.55em] bg-mint animate-[blink_1.1s_steps(1,end)_infinite]"></span>
       <span
         class="ml-2 whitespace-nowrap text-[0.72rem] tracking-[0.05em] text-dim transition-colors group-hover:text-mint"
       >{{ copied ? '[ copied ✓ ]' : '[ copy ]' }}</span>

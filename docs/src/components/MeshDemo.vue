@@ -13,13 +13,14 @@ import { onBeforeUnmount, onMounted, ref } from 'vue'
 const wrap = ref(null)
 const cv = ref(null)
 
-// Palette — keep in sync with the @theme block in src/style.css.
+// Page-blending grays match the @theme block in src/style.css; the
+// scene colors below them are the illustration's own palette.
 const C = {
-  line: '#1c2836',
-  lineBright: '#2a3a4d',
-  bright: '#eef4fa',
-  dim: '#7b8a9a',
-  faint: '#55636f',
+  line: '#262626',
+  lineBright: '#3d3d3d',
+  bright: '#f2f2f2',
+  dim: '#8b8b8b',
+  faint: '#595959',
   mint: '#4ee585',
   tuiBg: '#13151b',
   accent: '#a78bfa',
@@ -28,9 +29,9 @@ const C = {
   yellow: '#fbbf24',
   muted: '#64748b',
   soft: '#cbd5e1',
-  tuiPanel: '#334155',
+  tuiPanel: '#3d3d3d', // same neutral gray as lineBright: one border color
   chipBg: '#0f1620',
-  bg: '#0b0f14',
+  bg: '#000000',
 }
 
 const MONO = "ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace"
@@ -472,6 +473,9 @@ function curve(p0, p1, vertical) {
   }
 }
 
+// reserved strip at the canvas bottom for the zero-callouts line
+const STAT_H = 48
+
 function monitorHeight(fs) {
   const lh = fs * 1.62
   return Math.round(14 * lh + 108)
@@ -487,11 +491,12 @@ function layout(w) {
     const monW = Math.max(300, Math.min(470, w - 2 * NW - 4 * 26))
     fs = Math.max(9, Math.min(12, monW / 40))
     const monH = monitorHeight(fs)
-    H = Math.max(monH + 56, 476)
-    mon = { x: (w - monW) / 2, y: (H - monH) / 2 + 14, w: monW, h: monH }
-    nodes.macbook = { x: 8, y: H - NH - 6, w: NW, h: NH }
+    const sceneH = Math.max(monH + 56, 476)
+    H = sceneH + STAT_H
+    mon = { x: (w - monW) / 2, y: (sceneH - monH) / 2 + 14, w: monW, h: monH }
+    nodes.macbook = { x: 8, y: sceneH - NH - 6, w: NW, h: NH }
     const rx = w - NW - 8
-    const gap = (H - 3 * NH) / 4
+    const gap = (sceneH - 3 * NH) / 4
     nodes.fedora = { x: rx, y: gap, w: NW, h: NH }
     nodes.debian = { x: rx, y: gap * 2 + NH, w: NW, h: NH }
     nodes.mini = { x: rx, y: gap * 3 + NH * 2, w: NW, h: NH }
@@ -501,7 +506,7 @@ function layout(w) {
     fs = Math.max(8.5, Math.min(11, monW / 40))
     const monH = monitorHeight(fs)
     const gap = 46
-    H = NH + gap + monH + gap + NH + 16
+    H = NH + gap + monH + gap + NH + 16 + STAT_H
     mon = { x: (w - monW) / 2, y: NH + gap + 8, w: monW, h: monH }
     nodes.macbook = { x: (w - NW) / 2, y: 8, w: NW, h: NH }
     const bw = Math.min(NW, (w - 32) / 3)
@@ -620,7 +625,7 @@ function drawIcon(ctx, kind, cx, cy, led) {
 
 function drawNode(ctx, r, name, backend, kind, recv, copy) {
   const border = recv > 0.02 ? C.mint : copy > 0.02 ? C.accent : C.line
-  tuiBlock(ctx, r, name, 11, border, recv > 0.02 ? C.mint : copy > 0.02 ? C.accent : C.dim)
+  tuiBlock(ctx, r, name, 11, border, recv > 0.02 ? C.mint : copy > 0.02 ? C.accent : C.dim, C.bg)
   const glow = Math.max(recv, copy)
   if (glow > 0.02) {
     ctx.save()
@@ -642,7 +647,7 @@ function drawMonitor(ctx, L, t, now) {
   const { mon, fs } = L
   const lh = fs * 1.62
   const p = Math.round(fs * 1.2)
-  tuiBlock(ctx, mon, ' ssh-clipboard monitor ', fs, C.lineBright, C.dim, C.tuiBg)
+  tuiBlock(ctx, mon, ' ssh-clipboard monitor ', fs, C.lineBright, C.dim, C.bg)
   const x = mon.x + p
   const iw = mon.w - p * 2
   let y = mon.y + p + lh * 0.6
@@ -672,7 +677,7 @@ function drawMonitor(ctx, L, t, now) {
   y += lh * 0.9
 
   const peersR = { x, y, w: iw, h: lh * 2 + 14 }
-  tuiBlock(ctx, peersR, 'Peers', fs * 0.82, C.tuiPanel, C.accent, C.tuiBg)
+  tuiBlock(ctx, peersR, 'Peers', fs * 0.82, C.tuiPanel, C.accent)
   let py = y + lh * 0.62 + 7
   spans(
     ctx,
@@ -719,7 +724,7 @@ function drawMonitor(ctx, L, t, now) {
   y += peersR.h + lh * 0.85
 
   const actR = { x, y, w: iw, h: lh * 9.4 + 14 }
-  tuiBlock(ctx, actR, 'Clipboard activity', fs * 0.82, C.tuiPanel, C.accent, C.tuiBg)
+  tuiBlock(ctx, actR, 'Clipboard activity', fs * 0.82, C.tuiPanel, C.accent)
   const rfs = fs * 0.88
   font(ctx, rfs, false)
   const ch = ctx.measureText('0').width
@@ -937,7 +942,7 @@ onMounted(() => {
   }
 
   function draw(t, now) {
-    const { w, H, nodes, wires, sceneScale: s } = L
+    const { w, H, mon, nodes, wires, sceneScale: s } = L
     ctx.clearRect(0, 0, w, H)
     ctx.drawImage(dots, 0, 0, w, H)
     ctx.strokeStyle = C.lineBright
@@ -963,6 +968,31 @@ onMounted(() => {
       Math.max(trap(seg(t, T.recvA[0], T.recvA[1])), trap(seg(t, T.recvB[0], T.recvB[1]))), 0)
 
     drawMonitor(ctx, L, t, now)
+
+    // zero callouts, part of the illustration — sized to the monitor width
+    const segs = [
+      { t: '0', c: C.bright, b: true },
+      { t: ' relays', c: C.dim },
+      { t: '  ·  ', c: C.faint },
+      { t: '0', c: C.bright, b: true },
+      { t: ' accounts', c: C.dim },
+      { t: '  ·  ', c: C.faint },
+      { t: '0', c: C.bright, b: true },
+      { t: ' new ports', c: C.dim },
+    ]
+    const probe = 20
+    let probeW = 0
+    for (const sg of segs) {
+      font(ctx, probe, sg.b)
+      probeW += ctx.measureText(sg.t).width
+    }
+    const statFs = Math.max(11, Math.min(21, (probe * (mon.w - 28)) / probeW))
+    let statW = 0
+    for (const sg of segs) {
+      font(ctx, statFs, sg.b)
+      statW += ctx.measureText(sg.t).width
+    }
+    spans(ctx, mon.x + mon.w / 2 - statW / 2, H - STAT_H / 2 + statFs * 0.35, statFs, segs)
 
     if (reduced) return
 

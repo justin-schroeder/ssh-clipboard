@@ -94,14 +94,14 @@ const docLink =
 
 <template>
   <header class="sticky top-0 z-10 border-b border-line bg-bg">
-    <div class="flex w-full items-center justify-between gap-4 px-6 py-3 max-md:px-4 max-md:py-2.5">
+    <div class="mx-auto flex w-[min(90rem,calc(100vw-7rem))] items-center justify-between gap-4 py-4 max-md:w-[calc(100vw-2.5rem)] max-md:py-3">
       <a class="whitespace-nowrap font-semibold text-bright" href="#top">
-        ssh-clipboard<span class="text-mint animate-[blink_1.2s_steps(1,end)_infinite]">_</span>
+        ssh-clipboard<span class="text-mint">_</span>
       </a>
-      <nav class="flex items-center gap-4 text-[0.85rem] max-md:gap-3 max-md:text-[0.78rem]">
-        <a class="text-dim transition-colors hover:text-mint max-[560px]:hidden" href="#install">install</a>
-        <a class="text-dim transition-colors hover:text-mint max-[560px]:hidden" href="#commands">commands</a>
-        <a class="text-dim transition-colors hover:text-mint max-[560px]:hidden" href="#how-it-works">how&nbsp;it&nbsp;works</a>
+      <nav class="flex items-center gap-9 text-[0.9rem] max-md:gap-5 max-md:text-[0.8rem]">
+        <a class="text-ink transition-colors hover:text-mint max-[560px]:hidden" href="#install">install</a>
+        <a class="text-ink transition-colors hover:text-mint max-[560px]:hidden" href="#commands">commands</a>
+        <a class="text-ink transition-colors hover:text-mint max-[560px]:hidden" href="#how-it-works">how&nbsp;it&nbsp;works</a>
         <StarButton />
       </nav>
     </div>
@@ -109,73 +109,54 @@ const docLink =
 
   <main id="top">
     <!-- ── hero ─────────────────────────────── -->
-    <section class="relative px-5 pb-10 pt-14 text-left max-xl:text-center max-md:pt-10">
+    <section class="relative px-5 pb-16 pt-24 text-left max-xl:text-center max-md:pt-14">
       <div
-        class="mx-auto grid w-[min(90rem,calc(100vw-7rem))] grid-cols-[minmax(21rem,27rem)_minmax(0,1fr)] items-center gap-12 max-xl:grid-cols-1 max-md:gap-6 max-md:w-[calc(100vw-2.5rem)]"
+        class="mx-auto grid w-[min(90rem,calc(100vw-7rem))] grid-cols-[minmax(21rem,27rem)_minmax(0,1fr)] items-center gap-16 max-xl:grid-cols-1 max-md:gap-8 max-md:w-[calc(100vw-2.5rem)]"
       >
         <div>
-          <p class="mb-7 text-[0.8rem] tracking-[0.06em] text-dim max-xl:text-center">
-            macOS <span class="text-faint">·</span> Linux
-            <span class="text-faint">·</span> arm64 <span class="text-faint">·</span> x64
-            <span class="text-faint">·</span> <span class="text-mint">MIT</span>
-          </p>
           <h1
-            class="mb-6 text-[clamp(2.6rem,4.2vw,4.1rem)] font-semibold leading-[1.12] tracking-[-0.03em] text-bright"
+            class="mb-8 text-[clamp(2.6rem,4.2vw,4.1rem)] font-semibold leading-[1.12] tracking-[-0.03em] text-bright"
           >
-            <span>Your clipboard,</span><br />
+            <span>copy/paste,</span><br />
             <span class="text-mint">everywhere.</span>
           </h1>
-          <p class="mb-8 max-w-[38rem] text-[1.05rem] text-dim max-xl:mx-auto">
-            Peer-to-peer clipboard sync over encrypted SSH.
-            Copy on one machine, paste on another: text, images, files, and rich
-            content in their native formats.
-            <span class="text-amberish">Written in Rust ackchyually.</span>
+          <p class="mb-10 max-w-[38rem] text-[1.05rem] leading-[1.85] text-dim max-xl:mx-auto">
+            Peer-to-peer clipboard sync over SSH.
+            Copy anything on one machine, paste on another.
+            <span class="text-mint">Written in Rust ackchyually.</span>
           </p>
           <InstallPill />
         </div>
-        <div class="min-w-0">
+        <div class="relative isolate min-w-0">
+          <div
+            class="dither pointer-events-none absolute -inset-x-48 -inset-y-28 -z-10 text-mint opacity-[0.13] [mask-image:radial-gradient(70%_78%_at_50%_46%,black,transparent_82%)]"
+          ></div>
           <MeshDemo />
         </div>
       </div>
 
-      <p
-        class="mt-10 flex flex-wrap justify-center gap-3.5 text-[0.85rem] tracking-[0.03em] text-dim max-md:mt-7 max-md:gap-2 max-md:text-[0.78rem]"
-      >
-        <span><b class="font-bold text-mint">0</b> relays</span>
-        <span class="text-faint">·</span>
-        <span><b class="font-bold text-mint">0</b> accounts</span>
-        <span class="text-faint">·</span>
-        <span><b class="font-bold text-mint">0</b> open ports</span>
-        <span class="text-faint">·</span>
-        <span><b class="font-bold text-mint">∞</b> machines</span>
-      </p>
     </section>
 
     <!-- ── features ─────────────────────────── -->
     <section
-      class="mx-auto grid max-w-[46rem] grid-cols-[repeat(auto-fit,minmax(15rem,1fr))] gap-x-3.5 gap-y-5 px-5 pb-4 pt-10"
+      class="mx-auto grid w-[min(90rem,calc(100vw-7rem))] grid-cols-[repeat(auto-fit,minmax(16rem,1fr))] gap-x-16 gap-y-16 pb-8 pt-24 max-md:w-[calc(100vw-2.5rem)] lg:grid-cols-3"
     >
-      <div
-        v-for="f in features"
-        :key="f.name"
-        class="tui-block p-4 pt-3.5 transition-colors hover:border-linebright"
-      >
-        <span class="tui-title">{{ f.name }}</span>
-        <p class="text-[0.85rem] leading-[1.6] text-dim">{{ f.text }}</p>
+      <div v-for="f in features" :key="f.name">
+        <h3 class="mb-2 text-[0.95rem] font-semibold text-bright">
+          <span class="text-mint">*</span> {{ f.name }}
+        </h3>
+        <p class="pl-4 text-[0.85rem] leading-[1.7] text-dim">{{ f.text }}</p>
       </div>
     </section>
 
     <!-- ── docs with jump-link sidebar ──────── -->
     <div
-      class="mx-auto grid w-[min(66rem,calc(100vw-2.5rem))] grid-cols-[9.5rem_minmax(0,46rem)] justify-center gap-14 max-[1150px]:grid-cols-[minmax(0,46rem)]"
+      class="mx-auto mt-28 grid w-[min(90rem,calc(100vw-7rem))] grid-cols-[13rem_minmax(0,1fr)] gap-14 max-md:w-[calc(100vw-2.5rem)] max-[1150px]:grid-cols-[minmax(0,1fr)]"
     >
       <aside
-        class="sticky top-[5.5rem] flex flex-col gap-0.5 self-start pt-12 text-[0.82rem] max-[1150px]:hidden"
+        class="sticky top-[6.5rem] mt-[5.25rem] flex flex-col gap-1.5 self-start text-[0.95rem] max-[1150px]:hidden"
         aria-label="On this page"
       >
-        <span class="mb-2 text-[0.68rem] tracking-[0.14em] text-faint">
-          <span class="text-mint">#</span> docs
-        </span>
         <a
           v-for="s in sections"
           :key="s.id"
@@ -185,9 +166,9 @@ const docLink =
         >{{ (activeId === s.id ? '▌ ' : '  ') + s.title }}</a>
       </aside>
 
-      <div>
-        <section id="install" class="pb-2 pt-11">
-          <h2 class="mb-4 text-[1.35rem] font-semibold text-bright">
+      <div class="mx-auto w-full min-w-0 max-w-[46rem]">
+        <section id="install" class="pb-6 pt-20">
+          <h2 class="mb-6 text-[1.4rem] font-semibold text-bright">
             <span class="text-mint">#</span> Install
           </h2>
           <p class="mb-4 max-w-[42rem]">
@@ -211,8 +192,8 @@ $ ssh-clipboard"
           </ul>
         </section>
 
-        <section id="quick-start" class="pb-2 pt-11">
-          <h2 class="mb-4 text-[1.35rem] font-semibold text-bright">
+        <section id="quick-start" class="pb-6 pt-20">
+          <h2 class="mb-6 text-[1.4rem] font-semibold text-bright">
             <span class="text-mint">#</span> Quick start
           </h2>
           <p class="mb-4 max-w-[42rem]">
@@ -236,16 +217,16 @@ connected: macbookserver"
           />
         </section>
 
-        <section id="commands" class="pb-2 pt-11">
-          <h2 class="mb-4 text-[1.35rem] font-semibold text-bright">
+        <section id="commands" class="pb-6 pt-20">
+          <h2 class="mb-6 text-[1.4rem] font-semibold text-bright">
             <span class="text-mint">#</span> Commands
           </h2>
-          <dl class="my-5 overflow-hidden border border-line">
+          <dl class="my-8 overflow-hidden border border-line">
             <template v-for="c in commands" :key="c.cmd">
-              <dt class="bg-panel px-4 pt-3">
+              <dt class="bg-panel px-5 pt-4">
                 <code class="border-0 bg-transparent p-0 font-semibold text-mint">{{ c.cmd }}</code>
               </dt>
-              <dd class="border-b border-line bg-panel px-4 pb-3 pt-0.5 text-[0.88rem] text-dim last:border-b-0">
+              <dd class="border-b border-line bg-panel px-5 pb-4 pt-1 text-[0.88rem] text-dim last:border-b-0">
                 {{ c.desc }}
               </dd>
             </template>
@@ -258,11 +239,11 @@ connected: macbookserver"
           </p>
         </section>
 
-        <section id="how-it-works" class="pb-2 pt-11">
-          <h2 class="mb-4 text-[1.35rem] font-semibold text-bright">
+        <section id="how-it-works" class="pb-6 pt-20">
+          <h2 class="mb-6 text-[1.4rem] font-semibold text-bright">
             <span class="text-mint">#</span> How it works
           </h2>
-          <pre class="my-5 overflow-x-auto border border-line bg-panel px-5 py-4 text-[0.78rem] leading-[1.45] text-dim">
+          <pre class="my-8 overflow-x-auto border border-line bg-panel px-6 py-5 text-[0.78rem] leading-[1.45] text-dim">
 ┌──────────────┐         encrypted SSH         ┌──────────────┐
 │    macbook   │ ◀═══════════════════════════▶ │    fedora    │
 │  pasteboard  │    persistent · deduplicated  │ wayland/x11  │
@@ -282,8 +263,8 @@ connected: macbookserver"
           </p>
         </section>
 
-        <section id="updates" class="pb-2 pt-11">
-          <h2 class="mb-4 text-[1.35rem] font-semibold text-bright">
+        <section id="updates" class="pb-6 pt-20">
+          <h2 class="mb-6 text-[1.4rem] font-semibold text-bright">
             <span class="text-mint">#</span> Updates
           </h2>
           <p class="mb-4 max-w-[42rem]">
@@ -305,15 +286,20 @@ latest:  0.2.0"
         </section>
 
         <EarlyAccess />
-
-        <footer class="mt-16 border-t border-line pt-6 pb-16 text-[0.85rem] text-dim">
-          <p>
-            <a :class="docLink" href="https://github.com/standardagents/ssh-clipboard">GitHub</a> ·
-            <a :class="docLink" href="https://www.npmjs.com/package/ssh-clipboard">npm</a> ·
-            <a :class="docLink" href="https://github.com/standardagents/ssh-clipboard/blob/main/LICENSE">MIT license</a>
-          </p>
-        </footer>
       </div>
     </div>
+
+    <footer class="mt-24 border-t border-line/40 pt-8 pb-24 text-[0.85rem] text-dim">
+      <div
+        class="mx-auto flex w-[min(90rem,calc(100vw-7rem))] flex-wrap items-baseline justify-between gap-4 max-md:w-[calc(100vw-2.5rem)]"
+      >
+        <p>Built by Standard Agents. Open Source under MIT.</p>
+        <p>
+          <a :class="docLink" href="https://github.com/standardagents/ssh-clipboard">GitHub</a> ·
+          <a :class="docLink" href="https://www.npmjs.com/package/ssh-clipboard">npm</a> ·
+          <a :class="docLink" href="https://github.com/standardagents/ssh-clipboard/blob/main/LICENSE">MIT license</a>
+        </p>
+      </div>
+    </footer>
   </main>
 </template>

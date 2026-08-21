@@ -5,34 +5,20 @@
     ui-monospace, 'SF Mono', 'JetBrains Mono', 'Cascadia Code', Menlo, Consolas,
     'DejaVu Sans Mono', monospace;
 
-  /* site palette */
-  --color-bg: #0b0f14;
-  --color-raised: #10161e;
-  --color-panel: #0e141b;
-  --color-line: #1c2836;
-  --color-linebright: #2a3a4d;
-  --color-ink: #c9d5e1;
-  --color-bright: #eef4fa;
-  --color-dim: #7b8a9a;
-  --color-faint: #55636f;
+  /* 1-bit site palette: black, white (gray steps read as dither
+     levels), and one terminal green. The canvas hero keeps its own
+     colors — it is the sole colorful element. */
+  --color-bg: #000000;
+  --color-raised: #111111;
+  --color-panel: #070707;
+  --color-line: #262626;
+  --color-linebright: #3d3d3d;
+  --color-ink: #c9c9c9;
+  --color-bright: #f2f2f2;
+  --color-dim: #8b8b8b;
+  --color-faint: #595959;
   --color-mint: #4ee585;
   --color-mintdim: #2c8f55;
-  --color-amberish: #ffb454;
-  --color-cyanish: #6dd3e8;
-
-  /* real TUI palette from src/tui/mod.rs */
-  --color-tuibg: #13151b;
-  --color-tuiaccent: #a78bfa;
-  --color-tuicyan: #22d3ee;
-  --color-tuigreen: #34d399;
-  --color-tuiyellow: #fbbf24;
-  --color-tuimuted: #64748b;
-  --color-tuisoft: #cbd5e1;
-  --color-tuipanel: #334155;
-
-  /* early access card */
-  --color-eabg: #0e1018;
-  --color-eaviolet: #7c86f8;
 }
 
 @layer base {
@@ -45,8 +31,8 @@
     background: var(--color-bg);
     color: var(--color-ink);
     font-family: var(--font-mono);
-    font-size: 15px;
-    line-height: 1.7;
+    font-size: 16px;
+    line-height: 1.75;
     overflow-x: clip;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
@@ -98,6 +84,16 @@
        like a Ratatui `Block::title` ─── */
 
 @layer components {
+  /* 1-bit checkerboard texture; combine with opacity + mask for the
+     dithered-gradient look */
+  .dither {
+    background-image: repeating-conic-gradient(
+      currentColor 0% 25%,
+      transparent 0% 50%
+    );
+    background-size: 4px 4px;
+  }
+
   .tui-block {
     position: relative;
     border: 1px solid var(--color-line);
@@ -114,11 +110,4 @@
     line-height: 1.4;
     color: var(--color-mint);
   }
-}
-
-/* ─── keyframes (referenced via animate-[…] utilities) ─── */
-
-@keyframes blink {
-  0%, 49% { opacity: 1; }
-  50%, 100% { opacity: 0; }
 }
