@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -7,6 +8,8 @@ use ssh_clipboard::daemon;
 use ssh_clipboard::model::{Direction, MonitorEvent, human_bytes};
 use ssh_clipboard::{deploy, service, tui, update};
 use tokio::io::AsyncBufReadExt;
+
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Parser)]
 #[command(
@@ -68,12 +71,24 @@ enum ServiceAction {
     Restart,
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
+fn main() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("ssh-clipboard: initialize async runtime: {error}");
+            std::process::exit(1);
+        }
+    };
+    let result = runtime.block_on(run());
+    shutdown_runtime(runtime);
+    if let Err(error) = result {
         eprintln!("ssh-clipboard: {error:#}");
         std::process::exit(1);
     }
+}
+
+fn shutdown_runtime(runtime: tokio::runtime::Runtime) {
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
 }
 
 async fn run() -> Result<()> {
@@ -223,4 +238,36 @@ fn format_time(timestamp_millis: u64) -> String {
         (day / 1_000) % 60,
         day % 1_000
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    use super::*;
+
+    #[test]
+    fn runtime_shutdown_is_bounded_when_blocking_work_hangs() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::sync_channel(0);
+        let _task = runtime.handle().spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            finished_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+
+        shutdown_runtime(runtime);
+
+        assert!(started.elapsed() < Duration::from_millis(1_500));
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
 }
