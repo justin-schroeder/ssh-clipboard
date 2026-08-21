@@ -248,6 +248,8 @@ impl NativeClipboard {
             let mut added_files = false;
             #[cfg(target_os = "macos")]
             let mut native_formats = MacosFormats::default();
+            #[cfg(target_os = "linux")]
+            let mut native_formats = LinuxFormats::default();
             for representation in representations {
                 if representation.format.trim().is_empty()
                     || is_internal_marker(&representation.format)
@@ -263,6 +265,15 @@ impl NativeClipboard {
                     }
                     #[cfg(target_os = "macos")]
                     continue;
+                }
+                #[cfg(target_os = "linux")]
+                match native_formats.normalize(&representation.format, &representation.data) {
+                    LinuxFormat::Text(text) => {
+                        contents.push(ClipboardContent::Text(text.to_owned()));
+                        continue;
+                    }
+                    LinuxFormat::Duplicate => continue,
+                    LinuxFormat::Preserve => {}
                 }
                 #[cfg(target_os = "macos")]
                 let format = {
@@ -420,6 +431,51 @@ fn is_image_format(format: &str) -> bool {
             | "org.webmproject.webp"
             | "image/webp"
     )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_linux_plain_text_format(format: &str) -> bool {
+    matches!(
+        format,
+        "UTF8_STRING" | "public.utf8-plain-text" | "public.plain-text" | "NSStringPboardType"
+    ) || format.eq_ignore_ascii_case("text/plain")
+        || format.eq_ignore_ascii_case("text/plain;charset=utf-8")
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_plain_text<'a>(format: &str, data: &'a [u8]) -> Option<&'a str> {
+    is_linux_plain_text_format(format)
+        .then(|| std::str::from_utf8(data).ok())
+        .flatten()
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Default)]
+struct LinuxFormats {
+    added_text: bool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum LinuxFormat<'a> {
+    Text(&'a str),
+    Preserve,
+    Duplicate,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl LinuxFormats {
+    fn normalize<'a>(&mut self, format: &str, data: &'a [u8]) -> LinuxFormat<'a> {
+        let Some(text) = linux_plain_text(format, data) else {
+            return LinuxFormat::Preserve;
+        };
+        if self.added_text {
+            LinuxFormat::Duplicate
+        } else {
+            self.added_text = true;
+            LinuxFormat::Text(text)
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -709,6 +765,63 @@ mod tests {
         assert_eq!(
             formats.normalize("com.example.custom"),
             Some("com.example.custom".to_owned())
+        );
+    }
+
+    #[test]
+    fn linux_recognizes_native_and_portable_plain_text_formats() {
+        for format in [
+            "UTF8_STRING",
+            "text/plain",
+            "text/plain;charset=utf-8",
+            "text/plain;charset=UTF-8",
+            "public.utf8-plain-text",
+            "public.plain-text",
+            "NSStringPboardType",
+        ] {
+            assert!(is_linux_plain_text_format(format));
+        }
+        for format in [
+            "STRING",
+            "TEXT",
+            "COMPOUND_TEXT",
+            "text/html",
+            "public.html",
+            "com.example.custom",
+        ] {
+            assert!(!is_linux_plain_text_format(format));
+        }
+    }
+
+    #[test]
+    fn linux_plain_text_requires_valid_utf8() {
+        assert_eq!(
+            linux_plain_text("public.utf8-plain-text", "clipboard 東京".as_bytes()),
+            Some("clipboard 東京")
+        );
+        assert_eq!(linux_plain_text("public.utf8-plain-text", &[0xff, 0xfe]), None);
+        assert_eq!(linux_plain_text("com.example.custom", b"clipboard"), None);
+    }
+
+    #[test]
+    fn linux_collapses_equivalent_text_and_preserves_other_bytes() {
+        let mut formats = LinuxFormats::default();
+
+        assert_eq!(
+            formats.normalize("public.utf8-plain-text", b"clipboard"),
+            LinuxFormat::Text("clipboard")
+        );
+        assert_eq!(
+            formats.normalize("text/plain;charset=utf-8", b"clipboard"),
+            LinuxFormat::Duplicate
+        );
+        assert_eq!(
+            formats.normalize("public.utf8-plain-text", &[0xff]),
+            LinuxFormat::Preserve
+        );
+        assert_eq!(
+            formats.normalize("com.example.custom", b"clipboard"),
+            LinuxFormat::Preserve
         );
     }
 
