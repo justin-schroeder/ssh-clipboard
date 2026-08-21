@@ -66,7 +66,7 @@ impl ClipboardHandler for ChangeHandler {
 impl NativeClipboard {
     pub fn new(max_bytes: u64) -> Result<Self> {
         use clipboard_rs::ClipboardContext;
-        let context = ClipboardContext::new()
+        let context = run_native_operation(ClipboardContext::new)
             .map_err(|error| anyhow::anyhow!("initialize native clipboard: {error}"))?;
         Ok(Self {
             context: Mutex::new(context),
@@ -258,11 +258,11 @@ impl NativeClipboard {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl ClipboardBackend for NativeClipboard {
     fn capture(&self) -> Result<Option<Snapshot>> {
-        self.capture_sync()
+        run_native_operation(|| self.capture_sync())
     }
 
     fn apply(&self, representations: &[Representation]) -> Result<Snapshot> {
-        self.apply_sync(representations)
+        run_native_operation(|| self.apply_sync(representations))
     }
 
     fn name(&self) -> &'static str {
@@ -285,7 +285,8 @@ impl ClipboardBackend for NativeClipboard {
             return None;
         }
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        let mut watcher = ClipboardWatcherContext::new_with_interval(interval).ok()?;
+        let mut watcher =
+            run_native_operation(|| ClipboardWatcherContext::new_with_interval(interval)).ok()?;
         watcher.add_handler(ChangeHandler(sender));
         std::thread::Builder::new()
             .name("ssh-clipboard-watcher".into())
@@ -293,6 +294,19 @@ impl ClipboardBackend for NativeClipboard {
             .ok()?;
         Some(receiver)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn run_native_operation<T, F>(operation: F) -> T
+where
+    F: objc2::rc::AutoreleaseSafe + FnOnce() -> T,
+{
+    objc2::rc::autoreleasepool(|_| operation())
+}
+
+#[cfg(target_os = "linux")]
+fn run_native_operation<T>(operation: impl FnOnce() -> T) -> T {
+    operation()
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
