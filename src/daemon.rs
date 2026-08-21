@@ -22,6 +22,8 @@ use crate::protocol::{Message, read_message, write_clip, write_message};
 use crate::ssh;
 use crate::update::{self, CURRENT_VERSION};
 
+const WATCHER_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerStatus {
     pub node_id: Uuid,
@@ -78,6 +80,7 @@ struct Daemon {
     peers: RwLock<HashMap<Uuid, PeerLink>>,
     seen: Mutex<HashMap<Uuid, Instant>>,
     suppressed: Mutex<Option<[u8; 32]>>,
+    last_clipboard: Mutex<Option<[u8; 32]>>,
     apply_lock: Mutex<()>,
     events: broadcast::Sender<MonitorEvent>,
     desired_version: watch::Sender<String>,
@@ -106,6 +109,7 @@ impl Daemon {
             peers: RwLock::new(HashMap::new()),
             seen: Mutex::new(HashMap::new()),
             suppressed: Mutex::new(None),
+            last_clipboard: Mutex::new(None),
             apply_lock: Mutex::new(()),
             events,
             desired_version,
@@ -116,12 +120,19 @@ impl Daemon {
     async fn watch_clipboard(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
         let poll = Duration::from_millis(self.config.poll_interval_ms);
         let mut changes = self.clipboard.change_receiver(poll);
-        let mut interval = tokio::time::interval(Duration::from_millis(self.config.poll_interval_ms));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut previous = {
-            let _guard = self.apply_lock.lock().await;
-            self.capture_clipboard().await.ok().flatten()
+        let interval_poll = if changes.is_some() {
+            poll.max(WATCHER_RECONCILE_INTERVAL)
+        } else {
+            poll
         };
+        let mut interval = tokio::time::interval(interval_poll);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        {
+            let _guard = self.apply_lock.lock().await;
+            let initial = self.capture_clipboard().await.ok().flatten();
+            *self.last_clipboard.lock().await = initial.map(|snapshot| snapshot.fingerprint);
+        }
+        interval.reset();
         loop {
             tokio::select! {
                 () = next_clipboard_change(&mut changes, &mut interval) => {
@@ -134,10 +145,9 @@ impl Daemon {
                             continue;
                         }
                     };
-                    if previous.as_ref().is_some_and(|last| last.fingerprint == snapshot.fingerprint) {
+                    if !self.record_clipboard_fingerprint(snapshot.fingerprint).await {
                         continue;
                     }
-                    previous = Some(snapshot.clone());
                     if self.take_suppressed(snapshot.fingerprint).await {
                         continue;
                     }
@@ -282,6 +292,7 @@ impl Daemon {
         let _guard = self.apply_lock.lock().await;
         match self.apply_clipboard(Arc::clone(&clip)).await {
             Ok(snapshot) => {
+                *self.last_clipboard.lock().await = Some(snapshot.fingerprint);
                 *self.suppressed.lock().await = Some(snapshot.fingerprint);
             }
             Err(error) => warn!(%error, peer = %peer_name, clip = %clip.id, "failed to apply clipboard"),
@@ -332,6 +343,15 @@ impl Daemon {
 
     async fn take_suppressed(&self, fingerprint: [u8; 32]) -> bool {
         self.suppressed.lock().await.take() == Some(fingerprint)
+    }
+
+    async fn record_clipboard_fingerprint(&self, fingerprint: [u8; 32]) -> bool {
+        let mut last = self.last_clipboard.lock().await;
+        if *last == Some(fingerprint) {
+            return false;
+        }
+        *last = Some(fingerprint);
+        true
     }
 
     fn emit(&self, direction: Direction, peer: Option<String>, clip: &Clip) {
@@ -399,7 +419,11 @@ async fn next_clipboard_change(
     interval: &mut tokio::time::Interval,
 ) {
     if let Some(receiver) = changes {
-        if receiver.recv().await.is_some() {
+        let change = tokio::select! {
+            change = receiver.recv() => change,
+            _ = interval.tick() => return,
+        };
+        if change.is_some() {
             return;
         }
         *changes = None;
@@ -1201,6 +1225,30 @@ mod tests {
 
         assert!(daemon.take_suppressed(second_fingerprint).await);
         assert!(!daemon.take_suppressed(first_fingerprint).await);
+    }
+
+    #[tokio::test]
+    async fn remote_apply_refreshes_the_local_change_baseline() {
+        let clipboard = Arc::new(MockClipboard::default());
+        let daemon = Daemon::new(Config::default(), clipboard);
+        let local = Snapshot::new(vec![Representation {
+            item: 0,
+            format: "text/plain".into(),
+            data: b"local".to_vec(),
+        }]);
+        let remote = Arc::new(Clip::new(
+            Uuid::new_v4(),
+            vec![Representation {
+                item: 0,
+                format: "text/plain".into(),
+                data: b"remote".to_vec(),
+            }],
+        ));
+        *daemon.last_clipboard.lock().await = Some(local.fingerprint);
+
+        daemon.receive_clip(remote, "remote", Uuid::new_v4()).await;
+
+        assert!(daemon.record_clipboard_fingerprint(local.fingerprint).await);
     }
 
     #[test]
