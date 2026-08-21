@@ -399,7 +399,7 @@ impl Daemon {
 }
 
 async fn next_clipboard_change(
-    changes: &mut Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    changes: &mut Option<tokio::sync::mpsc::Receiver<()>>,
     interval: &mut tokio::time::Interval,
 ) {
     if let Some(receiver) = changes {

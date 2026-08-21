@@ -41,7 +41,7 @@ pub trait ClipboardBackend: Send + Sync {
     fn apply(&self, representations: &[Representation]) -> Result<Snapshot>;
     fn name(&self) -> &'static str;
 
-    fn change_receiver(&self, _interval: Duration) -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
+    fn change_receiver(&self, _interval: Duration) -> Option<tokio::sync::mpsc::Receiver<()>> {
         None
     }
 }
@@ -53,12 +53,12 @@ pub struct NativeClipboard {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-struct ChangeHandler(tokio::sync::mpsc::UnboundedSender<()>);
+struct ChangeHandler(tokio::sync::mpsc::Sender<()>);
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl ClipboardHandler for ChangeHandler {
     fn on_clipboard_change(&mut self) {
-        let _ = self.0.send(());
+        let _ = self.0.try_send(());
     }
 }
 
@@ -276,7 +276,7 @@ impl ClipboardBackend for NativeClipboard {
         };
     }
 
-    fn change_receiver(&self, interval: Duration) -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
+    fn change_receiver(&self, interval: Duration) -> Option<tokio::sync::mpsc::Receiver<()>> {
         #[cfg(target_os = "linux")]
         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
             // clipboard-rs' current Wayland watcher compares text and MIME names,
@@ -284,7 +284,7 @@ impl ClipboardBackend for NativeClipboard {
             // snapshot polling below is required for correctness on Wayland.
             return None;
         }
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
         let mut watcher = ClipboardWatcherContext::new_with_interval(interval).ok()?;
         watcher.add_handler(ChangeHandler(sender));
         std::thread::Builder::new()
@@ -535,5 +535,25 @@ mod tests {
             data: b"same".to_vec(),
         }]);
         assert_ne!(first.fingerprint, second.fingerprint);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn watcher_notifications_are_coalesced_while_capture_is_busy() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let mut handler = ChangeHandler(sender);
+
+        for _ in 0..10_000 {
+            handler.on_clipboard_change();
+        }
+
+        assert_eq!(receiver.try_recv(), Ok(()));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        handler.on_clipboard_change();
+        assert_eq!(receiver.try_recv(), Ok(()));
     }
 }
